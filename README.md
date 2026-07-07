@@ -79,21 +79,21 @@ This rebuilds `supersplat/dist/` and copies it into `app/`.
 
 1. Load a 3DGS `.ply`.
 2. Calibrate scale if needed: use the `Measurement` tool, measure a known length, type the real length in meters, then click `Apply Scale`.
-3. Use `Place 10cm Cube` or numeric fields to place a 3D bbox.
-4. Use `Add BBox` / `Remove BBox` for multiple labels.
+3. Click `Draw BBox`, then click visible splat points to append 10cm bbox segments.
+4. Use `Undo Step` to remove the last bbox placement, or `Add BBox` / `Remove BBox` for manual labels.
 5. Adjust bbox center, size, and Euler rotation.
 6. Set `View mask` radius in pixels.
 7. Click `Export View RGB+Mask` for the current renderer camera.
 
 After scale calibration, bbox center/size fields and spiral capture radii are shown and edited in meters. Exports include both calibrated meter values and raw scene-unit values.
+When multiple bboxes exist, the visible segmented splats and exported mask are the union of all bbox-derived segments. The per-bbox records remain in JSON so annotators can see which 3D boxes contributed to the merged semantic mask.
 
 Exported current-view files:
 
 ```text
 current_rgb.png
 current_overlay.png
-current_01_<bbox_id>_mask.png
-current_02_<bbox_id>_mask.png
+current_mask.png
 current_annotation.json
 ```
 
@@ -101,20 +101,35 @@ current_annotation.json
 
 The `Auto capture` controls generate renderer-view data by moving the camera around a target point.
 
-- `cap-cx/cy/cz`: spiral target center in current scene units
+- `cap-cx/cy/cz`: capture target center in calibrated meters
 - `d theta`: angular step in degrees
-- radii list: comma/space separated scene-unit radii, e.g. `1,2,3,4,5,6,7,8,9,10`
+- radii list: comma/space separated calibrated meter radii, e.g. `1,2,3,4,5,6,7,8,9,10`
 - `Choose Output Folder`: writes files directly to a selected local folder in Chrome/Edge
-- `Run Spiral Export`: captures RGB, overlay, masks, annotations, and `spiral_manifest.json`
+- `Run Spiral Export`: captures RGB, overlay, merged union mask, annotations, and `spiral_manifest.json`
+- `Run Random Dome Export`: captures random views inside an upper hemisphere while excluding an inner vertical cylinder
+
+After metric calibration, `cap-cx/cy/cz`, spiral radii, random outer hemisphere radius, and random inner cylinder radius are all edited in meters.
+
+Random dome parameters:
+
+- count: number of random views
+- outer radius: maximum camera distance as an upper hemisphere around the target
+- inner radius: excluded vertical cylinder radius around the target
+- seed: optional deterministic random seed
 
 Example output:
 
 ```text
 spiral_0000_r1p000_t0p000_rgb.png
 spiral_0000_r1p000_t0p000_overlay.png
-spiral_0000_r1p000_t0p000_01_branch_001_mask.png
+spiral_0000_r1p000_t0p000_mask.png
 spiral_0000_r1p000_t0p000_annotation.json
 spiral_manifest.json
+random_0000_d2p418_rgb.png
+random_0000_d2p418_overlay.png
+random_0000_d2p418_mask.png
+random_0000_d2p418_annotation.json
+random_dome_manifest.json
 ```
 
 ## Data Policy

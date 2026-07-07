@@ -38,12 +38,22 @@ type ProjectedBox = {
 };
 
 type ViewMask = {
-    box: Box;
     maskFile: string;
     area: number;
     bbox: number[] | null;
     projectedPoints: number;
     pixels: Uint8ClampedArray;
+};
+
+type PreparedBox = {
+    box: Box;
+    half: [number, number, number];
+    rotation: number[];
+};
+
+type BoxHistorySnapshot = {
+    boxes: Box[];
+    activeBoxIndex: number;
 };
 
 type HandleDrag = {
@@ -53,6 +63,16 @@ type HandleDrag = {
     planePoint: Vec3;
     planeNormal: Vec3;
     rotation: number[];
+};
+
+type CaptureVolumeHandle = 'center' | 'outer' | 'inner';
+
+type CaptureVolumeDrag = {
+    handle: CaptureVolumeHandle;
+    pointerId: number;
+    planePoint: Vec3;
+    planeNormal: Vec3;
+    startCenter: Vec3;
 };
 
 const cornerSigns = [
@@ -68,6 +88,9 @@ const edges = [
 
 const lineColor = new Color(1, 0.08, 0.02, 1);
 const activeLineColor = new Color(0.1, 0.7, 1, 1);
+const captureOuterColor = new Color(0.1, 0.85, 1, 1);
+const captureInnerColor = new Color(1, 0.78, 0.1, 1);
+const captureAxisColor = new Color(0.5, 0.95, 0.55, 1);
 const defaultCubeMeters = 0.1;
 const defaultMaskRadiusPx = 2;
 const segmentDebounceMs = 100;
@@ -193,8 +216,19 @@ const cloneBox = (box: Box): Box => ({
     euler: [box.euler[0], box.euler[1], box.euler[2]]
 });
 
-const safeFilePart = (value: string) => {
-    return (value || 'bbox').trim().replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '') || 'bbox';
+const seededRandom = (seed: string) => {
+    let h = 2166136261;
+    for (let i = 0; i < seed.length; i++) {
+        h ^= seed.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return () => {
+        h += 0x6d2b79f5;
+        let t = h;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
 };
 
 class BBoxAnnotation {
@@ -218,13 +252,19 @@ class BBoxAnnotation {
     spiralCenterInputs = new Map<string, HTMLInputElement>();
     spiralRadiiInput: HTMLInputElement;
     spiralThetaInput: HTMLInputElement;
+    randomCountInput: HTMLInputElement;
+    randomOuterRadiusInput: HTMLInputElement;
+    randomInnerCylinderInput: HTMLInputElement;
+    randomSeedInput: HTMLInputElement;
     outputStatus: HTMLDivElement;
     segmentStatus: HTMLDivElement;
     canvasContainer: HTMLElement | null;
     handleSvg: SVGSVGElement | null = null;
     handleNodes: SVGCircleElement[] = [];
+    volumeHandleNodes = new Map<CaptureVolumeHandle, SVGCircleElement>();
     hoverNode: SVGCircleElement | null = null;
     handleDrag: HandleDrag | null = null;
+    volumeDrag: CaptureVolumeDrag | null = null;
     handleRay = new Ray();
     hoverPoint: Vec3 | null = null;
     hoverPending: { nx: number; ny: number } | null = null;
@@ -271,7 +311,10 @@ class BBoxAnnotation {
     lastMeasuredSceneLength = 0;
     outputDirHandle: any = null;
     spiralRunning = false;
+    captureVolumeVisible = false;
+    captureVolumeButton: HTMLButtonElement;
     activeBoxIndex = 0;
+    boxUndoStack: BoxHistorySnapshot[] = [];
     box: Box = {
         id: 'branch_001',
         label: 'branch',
@@ -279,7 +322,7 @@ class BBoxAnnotation {
         size: [1, 1, 1],
         euler: [0, 0, 0]
     };
-    boxes: Box[] = [this.box];
+    boxes: Box[] = [];
 
     constructor(events: Events, scene: Scene) {
         this.events = events;
@@ -394,11 +437,14 @@ class BBoxAnnotation {
         } catch (err) {
             spiralRadii = null;
         }
+        const randomOuterRadius = this.randomOuterRadiusInput ? this.randomOuterRadiusScene() : null;
+        const randomInnerCylinder = this.randomInnerCylinderInput ? this.randomInnerCylinderScene() : null;
         this.metersPerSceneUnit = value;
         localStorage.setItem(metricStorageKey, `${value}`);
         this.writeMetricInputs();
         this.writeInputs();
         this.writeSpiralInputsFromSceneValues(spiralCenter, spiralRadii);
+        this.writeRandomInputsFromSceneValues(randomOuterRadius, randomInnerCylinder);
         this.events.fire('metric.scale.changed', value);
         this.scene.forceRender = true;
         this.drawPreviewOverlay();
@@ -444,6 +490,9 @@ class BBoxAnnotation {
                 left: 12px;
                 bottom: 12px;
                 width: 360px;
+                max-height: calc(100vh - 24px);
+                display: flex;
+                flex-direction: column;
             }
             .bbox-preview {
                 right: 12px;
@@ -491,6 +540,11 @@ class BBoxAnnotation {
             }
             .bbox-body,
             .bbox-preview-body { padding: 9px 10px 10px; }
+            .bbox-body {
+                overflow-y: auto;
+                overscroll-behavior: contain;
+                scrollbar-width: thin;
+            }
             .bbox-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 4px 0 7px; }
             .bbox-row.two { grid-template-columns: 1fr 1fr; }
             .bbox-row.four { grid-template-columns: repeat(4, 1fr); }
@@ -616,6 +670,22 @@ class BBoxAnnotation {
             .bbox-corner-handle.active {
                 fill: #55c7ff;
                 r: 7px;
+            }
+            .bbox-volume-handle {
+                pointer-events: all;
+                cursor: grab;
+                fill: #55c7ff;
+                stroke: #06131c;
+                stroke-width: 3px;
+                paint-order: stroke fill;
+                filter: drop-shadow(0 1px 5px rgba(0, 0, 0, 0.8));
+            }
+            .bbox-volume-handle[data-handle="outer"] { fill: #35e6ff; }
+            .bbox-volume-handle[data-handle="inner"] { fill: #ffd447; }
+            .bbox-volume-handle:hover,
+            .bbox-volume-handle.active {
+                r: 8px;
+                stroke: #ffffff;
             }
             .bbox-pick-hover {
                 pointer-events: none;
@@ -809,7 +879,7 @@ class BBoxAnnotation {
         const drawRow = document.createElement('div');
         drawRow.className = 'bbox-row two';
         this.drawButton = this.button('Draw BBox', () => this.toggleDrawMode());
-        this.cubeButton = this.button('Place 10cm Cube', () => this.toggleCubeMode());
+        this.cubeButton = this.button('Undo Step', () => this.undoBoxStep());
         drawRow.append(
             this.drawButton,
             this.cubeButton
@@ -1050,9 +1120,23 @@ class BBoxAnnotation {
             this.handleNodes.push(circle);
         }
 
+        (['center', 'outer', 'inner'] as CaptureVolumeHandle[]).forEach((handle) => {
+            const circle = document.createElementNS(ns, 'circle');
+            circle.classList.add('bbox-volume-handle');
+            circle.setAttribute('r', handle === 'center' ? '7' : '6');
+            circle.setAttribute('data-handle', handle);
+            circle.setAttribute('visibility', 'hidden');
+            circle.addEventListener('pointerdown', event => this.startVolumeDrag(event, handle), true);
+            svg.appendChild(circle);
+            this.volumeHandleNodes.set(handle, circle);
+        });
+
         window.addEventListener('pointermove', event => this.moveHandleDrag(event), true);
         window.addEventListener('pointerup', event => this.endHandleDrag(event), true);
         window.addEventListener('pointercancel', event => this.endHandleDrag(event), true);
+        window.addEventListener('pointermove', event => this.moveVolumeDrag(event), true);
+        window.addEventListener('pointerup', event => this.endVolumeDrag(event), true);
+        window.addEventListener('pointercancel', event => this.endVolumeDrag(event), true);
 
         return svg;
     }
@@ -1087,14 +1171,19 @@ class BBoxAnnotation {
         this.boxSelect.style.width = '100%';
         this.boxSelect.addEventListener('change', () => {
             this.readInputs();
+            if (!this.boxes.length) {
+                this.segmentMessage('active bbox: none');
+                return;
+            }
             this.activeBoxIndex = clamp(Number(this.boxSelect.value), 0, this.boxes.length - 1);
             this.box = cloneBox(this.boxes[this.activeBoxIndex]);
             this.writeInputs();
             this.scene.forceRender = true;
             this.drawPreviewOverlay();
             this.updateHandles();
-            this.segmentActive = false;
-            this.segmentMessage(`active bbox: ${this.box.id}`);
+            this.segmentActive = true;
+            this.scheduleSegmentUpdate(0);
+            this.segmentMessage(`active bbox: ${this.box.id}; union segment stays visible`);
         });
 
         const focus = this.button('Focus Box', () => this.focus());
@@ -1127,6 +1216,7 @@ class BBoxAnnotation {
             input.step = '0.01';
             input.value = `${this.sceneToMeters(Number(value)).toFixed(4)}`;
             input.title = `${String(id)} meters`;
+            input.addEventListener('input', () => this.captureVolumeInputsChanged());
             this.spiralCenterInputs.set(String(id), input);
             row.appendChild(input);
         });
@@ -1165,11 +1255,75 @@ class BBoxAnnotation {
             })
         );
 
+        const randomHint = document.createElement('div');
+        randomHint.className = 'bbox-status';
+        randomHint.textContent = 'random dome: count / outer hemisphere m / inner cylinder m / seed';
+
+        const randomRow = document.createElement('div');
+        randomRow.className = 'bbox-row four';
+        this.randomCountInput = document.createElement('input');
+        this.randomCountInput.type = 'number';
+        this.randomCountInput.step = '1';
+        this.randomCountInput.min = '1';
+        this.randomCountInput.max = '10000';
+        this.randomCountInput.value = '120';
+        this.randomCountInput.placeholder = 'count';
+        this.randomCountInput.title = 'random view count';
+
+        this.randomOuterRadiusInput = document.createElement('input');
+        this.randomOuterRadiusInput.type = 'number';
+        this.randomOuterRadiusInput.step = '0.1';
+        this.randomOuterRadiusInput.min = '0.001';
+        this.randomOuterRadiusInput.value = '3.0';
+        this.randomOuterRadiusInput.placeholder = 'outer m';
+        this.randomOuterRadiusInput.title = 'outer hemisphere radius in meters';
+        this.randomOuterRadiusInput.addEventListener('input', () => this.captureVolumeInputsChanged());
+
+        this.randomInnerCylinderInput = document.createElement('input');
+        this.randomInnerCylinderInput.type = 'number';
+        this.randomInnerCylinderInput.step = '0.1';
+        this.randomInnerCylinderInput.min = '0';
+        this.randomInnerCylinderInput.value = '0.5';
+        this.randomInnerCylinderInput.placeholder = 'inner m';
+        this.randomInnerCylinderInput.title = 'inner excluded cylinder radius in meters';
+        this.randomInnerCylinderInput.addEventListener('input', () => this.captureVolumeInputsChanged());
+
+        this.randomSeedInput = document.createElement('input');
+        this.randomSeedInput.type = 'text';
+        this.randomSeedInput.value = '';
+        this.randomSeedInput.placeholder = 'seed';
+        this.randomSeedInput.title = 'optional deterministic random seed';
+        randomRow.append(
+            this.randomCountInput,
+            this.randomOuterRadiusInput,
+            this.randomInnerCylinderInput,
+            this.randomSeedInput
+        );
+
+        const randomActions = document.createElement('div');
+        randomActions.className = 'bbox-row two';
+        this.captureVolumeButton = this.button('Spawn Volume', () => this.toggleCaptureVolume());
+        randomActions.append(
+            this.captureVolumeButton,
+            this.button('Run Random Dome Export', () => {
+                this.runRandomDomeExport().catch(err => this.segmentMessage(`random export error: ${err.message ?? err}`));
+            })
+        );
+        const stopRow = document.createElement('div');
+        stopRow.className = 'bbox-row two';
+        stopRow.append(
+            this.button('Stop Export', () => {
+                this.spiralRunning = false;
+                this.segmentMessage('export: stopping after current view...');
+            }),
+            this.button('Use BBox Center', () => this.setSpiralCenterFromBox())
+        );
+
         this.outputStatus = document.createElement('div');
         this.outputStatus.className = 'bbox-segment-status';
         this.outputStatus.textContent = 'output: browser downloads until a folder is chosen';
 
-        wrap.append(radiiRow, actions, this.outputStatus);
+        wrap.append(radiiRow, actions, randomHint, randomRow, randomActions, stopRow, this.outputStatus);
         return wrap;
     }
 
@@ -1370,41 +1524,27 @@ class BBoxAnnotation {
         const centers = splat.entity.gsplat.instance.sorter.centers as Float32Array;
         const state = splat.splatData.getProp('state') as Uint8Array;
         const world = splat.worldTransform;
-        const cx = this.box.center[0];
-        const cy = this.box.center[1];
-        const cz = this.box.center[2];
-        const hx = Math.max(this.box.size[0], 0.001) * 0.5;
-        const hy = Math.max(this.box.size[1], 0.001) * 0.5;
-        const hz = Math.max(this.box.size[2], 0.001) * 0.5;
-        const r = rotationMatrix(this.box.euler[0], this.box.euler[1], this.box.euler[2]);
+        const boxes = this.preparedBoxes();
         const point = this.segmentPoint;
 
-        this.segmentMessage(`segmenting ${formatCount(total)} points...`);
+        this.segmentMessage(`segmenting ${formatCount(total)} points across ${this.boxes.length} bboxes...`);
 
         const count = await this.scene.commandQueue.enqueue(async () => {
             const selectedCount = splat.state.replaceSelectedByPredicate((i) => {
+                if (state && (state[i] & (State.locked | State.deleted)) !== 0) {
+                    return false;
+                }
                 const offset = i * 3;
                 point.set(centers[offset], centers[offset + 1], centers[offset + 2]);
                 world.transformPoint(point, point);
-
-                const dx = point.x - cx;
-                const dy = point.y - cy;
-                const dz = point.z - cz;
-                if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(dz)) {
-                    return false;
-                }
-
-                const lx = r[0] * dx + r[3] * dy + r[6] * dz;
-                const ly = r[1] * dx + r[4] * dy + r[7] * dz;
-                const lz = r[2] * dx + r[5] * dy + r[8] * dz;
-                return Math.abs(lx) <= hx && Math.abs(ly) <= hy && Math.abs(lz) <= hz;
+                return this.pointInPreparedBoxes(point, boxes);
             });
             await splat.updateState();
             return selectedCount;
         });
 
         this.segmentLastCount = count;
-        this.segmentMessage(`segment: ${formatCount(count)} / ${formatCount(total)} points in bbox`);
+        this.segmentMessage(`segment union: ${formatCount(count)} / ${formatCount(total)} points in ${this.boxes.length} bboxes`);
     }
 
     async clearSegmentSelection() {
@@ -1501,7 +1641,9 @@ class BBoxAnnotation {
             ],
             euler: [num('rx'), num('ry'), num('rz')]
         };
-        this.boxes[this.activeBoxIndex] = cloneBox(this.box);
+        if (this.boxes.length) {
+            this.boxes[this.activeBoxIndex] = cloneBox(this.box);
+        }
         this.drawDepth = this.box.size[2];
         if (sync) {
             this.syncBoxSelect();
@@ -1533,6 +1675,14 @@ class BBoxAnnotation {
         if (!this.boxSelect) return;
         const current = `${this.activeBoxIndex}`;
         this.boxSelect.replaceChildren();
+        if (!this.boxes.length) {
+            const option = document.createElement('option');
+            option.value = '0';
+            option.textContent = 'No bbox';
+            this.boxSelect.appendChild(option);
+            this.boxSelect.value = '0';
+            return;
+        }
         this.boxes.forEach((box, index) => {
             const option = document.createElement('option');
             option.value = `${index}`;
@@ -1542,15 +1692,69 @@ class BBoxAnnotation {
         this.boxSelect.value = current;
     }
 
+    pushBoxUndo() {
+        this.boxUndoStack.push({
+            boxes: this.boxes.map(box => cloneBox(box)),
+            activeBoxIndex: this.activeBoxIndex
+        });
+        if (this.boxUndoStack.length > 100) {
+            this.boxUndoStack.shift();
+        }
+    }
+
+    restoreBoxes(snapshot: BoxHistorySnapshot) {
+        this.boxes = snapshot.boxes.map(box => cloneBox(box));
+        this.activeBoxIndex = this.boxes.length ? clamp(snapshot.activeBoxIndex, 0, this.boxes.length - 1) : 0;
+        if (this.boxes.length) {
+            this.box = cloneBox(this.boxes[this.activeBoxIndex]);
+        }
+        this.drawDepth = this.box.size[2];
+        this.writeInputs();
+        this.syncBoxSelect();
+        this.scene.forceRender = true;
+        this.drawPreviewOverlay();
+        this.updateHandles();
+        this.segmentActive = true;
+        this.scheduleSegmentUpdate(0);
+    }
+
+    undoBoxStep() {
+        const snapshot = this.boxUndoStack.pop();
+        if (!snapshot) {
+            this.segmentMessage('undo: no bbox step to revert');
+            return;
+        }
+        this.restoreBoxes(snapshot);
+        this.segmentMessage(`undo: restored ${this.boxes.length} bbox${this.boxes.length === 1 ? '' : 'es'}`);
+    }
+
+    nextBoxId() {
+        const used = new Set(this.boxes.map(box => box.id));
+        let index = this.boxes.length + 1;
+        let id = `branch_${String(index).padStart(3, '0')}`;
+        while (used.has(id)) {
+            index++;
+            id = `branch_${String(index).padStart(3, '0')}`;
+        }
+        return id;
+    }
+
     addBox() {
         this.readInputs(false);
+        this.pushBoxUndo();
         const next = cloneBox(this.box);
-        next.id = `branch_${String(this.boxes.length + 1).padStart(3, '0')}`;
-        next.center = [
-            next.center[0] + Math.max(next.size[0] * 0.2, 0.02),
-            next.center[1],
-            next.center[2]
-        ];
+        next.id = this.nextBoxId();
+        if (!this.boxes.length) {
+            const size = this.cubeSceneSize();
+            next.size = [size, size, size];
+            next.euler = [0, 0, 0];
+        } else {
+            next.center = [
+                next.center[0] + Math.max(next.size[0] * 0.2, 0.02),
+                next.center[1],
+                next.center[2]
+            ];
+        }
         this.boxes.push(next);
         this.activeBoxIndex = this.boxes.length - 1;
         this.box = cloneBox(next);
@@ -1559,8 +1763,9 @@ class BBoxAnnotation {
         this.scene.forceRender = true;
         this.drawPreviewOverlay();
         this.updateHandles();
-        this.segmentActive = false;
-        this.segmentMessage(`bbox added: ${this.box.id}`);
+        this.segmentActive = true;
+        this.scheduleSegmentUpdate(0);
+        this.segmentMessage(`bbox added: ${this.box.id}; union segment updated`);
     }
 
     removeBox() {
@@ -1569,6 +1774,7 @@ class BBoxAnnotation {
             return;
         }
 
+        this.pushBoxUndo();
         const removed = this.boxes.splice(this.activeBoxIndex, 1)[0];
         this.activeBoxIndex = clamp(this.activeBoxIndex, 0, this.boxes.length - 1);
         this.box = cloneBox(this.boxes[this.activeBoxIndex]);
@@ -1577,8 +1783,9 @@ class BBoxAnnotation {
         this.scene.forceRender = true;
         this.drawPreviewOverlay();
         this.updateHandles();
-        this.segmentActive = false;
-        this.segmentMessage(`bbox removed: ${removed.id}`);
+        this.segmentActive = true;
+        this.scheduleSegmentUpdate(0);
+        this.segmentMessage(`bbox removed: ${removed.id}; union segment updated`);
     }
 
     syncSliders() {
@@ -1673,7 +1880,7 @@ class BBoxAnnotation {
     }
 
     toggleDrawMode() {
-        this.setDrawMode(!this.drawMode);
+        this.setDrawMode(true);
     }
 
     setDrawMode(active: boolean) {
@@ -1692,7 +1899,7 @@ class BBoxAnnotation {
         if (this.canvasContainer) {
             this.canvasContainer.style.cursor = active || this.cubeMode ? 'crosshair' : '';
         }
-        this.status(active ? 'Draw mode: hover a visible splat point, then click to place a 10cm cube' : 'Draw mode off');
+        this.status(active ? 'Draw mode: click visible splat points to append 10cm bbox segments' : 'Draw mode off');
     }
 
     toggleCubeMode() {
@@ -1736,11 +1943,39 @@ class BBoxAnnotation {
         this.scheduleSegmentUpdate();
     }
 
-    placeCubeAt(position: Vec3) {
+    toggleCaptureVolume() {
+        this.captureVolumeVisible = !this.captureVolumeVisible;
+        this.captureVolumeButton.classList[this.captureVolumeVisible ? 'add' : 'remove']('active');
+        this.scene.forceRender = true;
+        this.updateHandles();
+        this.status(this.captureVolumeVisible ? 'Capture volume spawned. Drag center / outer / inner handles.' : 'Capture volume hidden');
+    }
+
+    captureVolumeInputsChanged() {
+        if (!this.captureVolumeVisible) return;
+        this.scene.forceRender = true;
+        this.updateHandles();
+    }
+
+    placeCubeAt(position: Vec3, append = false) {
         const size = this.cubeSceneSize();
-        this.box.center = [position.x, position.y, position.z];
-        this.box.size = [size, size, size];
-        this.box.euler = [0, 0, 0];
+        this.pushBoxUndo();
+        if (append) {
+            const next: Box = {
+                id: this.nextBoxId(),
+                label: this.box.label || 'branch',
+                center: [position.x, position.y, position.z],
+                size: [size, size, size],
+                euler: [0, 0, 0]
+            };
+            this.boxes.push(next);
+            this.activeBoxIndex = this.boxes.length - 1;
+            this.box = cloneBox(next);
+        } else {
+            this.box.center = [position.x, position.y, position.z];
+            this.box.size = [size, size, size];
+            this.box.euler = [0, 0, 0];
+        }
         this.drawDepth = size;
         this.touched = true;
         this.writeInputs();
@@ -1749,7 +1984,9 @@ class BBoxAnnotation {
         this.updateHandles();
         this.segmentActive = true;
         this.scheduleSegmentUpdate(0);
-        this.status(`${(this.cubeMeters() * 100).toFixed(0)}cm cube placed at clicked splat point`);
+        this.status(append ?
+            `${(this.cubeMeters() * 100).toFixed(0)}cm bbox added from clicked splat point` :
+            `${(this.cubeMeters() * 100).toFixed(0)}cm cube placed at clicked splat point`);
     }
 
     async updateHoverPick(nx: number, ny: number) {
@@ -1802,7 +2039,7 @@ class BBoxAnnotation {
             swallow(event);
 
             const p = point(event);
-            this.status('Picking splat point for 10cm cube...');
+            this.status(this.drawMode ? 'Picking splat point for new 10cm bbox...' : 'Picking splat point for 10cm cube...');
             const picked = await this.scene.camera.intersect(p.nx, p.ny);
             const result = picked ?? (this.hoverPoint ? { position: this.hoverPoint } : null);
             if (!result) {
@@ -1810,7 +2047,7 @@ class BBoxAnnotation {
                 return;
             }
             this.hoverPoint = result.position.clone();
-            this.placeCubeAt(result.position);
+            this.placeCubeAt(result.position, this.drawMode);
         };
 
         const pointermove = (event: PointerEvent) => {
@@ -1940,6 +2177,101 @@ class BBoxAnnotation {
         this.status('Corner moved. Fine tune with handles, sliders, or numeric inputs.');
     }
 
+    startVolumeDrag(event: PointerEvent, handle: CaptureVolumeHandle) {
+        if (event.pointerType === 'mouse' && event.button !== 0) return;
+        if (!this.captureVolumeVisible) return;
+        this.stopPointerEvent(event);
+
+        const center = this.spiralCenter();
+        const target = event.currentTarget as SVGCircleElement;
+        target.setPointerCapture(event.pointerId);
+        target.classList.add('active');
+        this.volumeDrag = {
+            handle,
+            pointerId: event.pointerId,
+            planePoint: center.clone(),
+            planeNormal: handle === 'center' ? this.scene.camera.forward.clone().normalize() : new Vec3(0, 1, 0),
+            startCenter: center.clone()
+        };
+        this.status(`Dragging capture ${handle}`);
+    }
+
+    moveVolumeDrag(event: PointerEvent) {
+        if (!this.volumeDrag || event.pointerId !== this.volumeDrag.pointerId) return;
+        this.stopPointerEvent(event);
+        const p = this.pointerPoint(event);
+        if (!p) return;
+
+        const hit = this.intersectScreenPlane(
+            p.x,
+            p.y,
+            this.volumeDrag.planePoint,
+            this.volumeDrag.planeNormal,
+            this.handleRay
+        );
+        if (!hit) return;
+
+        this.applyVolumePoint(hit);
+    }
+
+    endVolumeDrag(event: PointerEvent) {
+        if (!this.volumeDrag || event.pointerId !== this.volumeDrag.pointerId) return;
+        this.stopPointerEvent(event);
+        this.volumeHandleNodes.forEach((node) => {
+            node.classList.remove('active');
+            try {
+                node.releasePointerCapture(event.pointerId);
+            } catch (err) {
+                // Pointer capture may already be released by the browser.
+            }
+        });
+        this.volumeDrag = null;
+        this.status('Capture volume adjusted');
+    }
+
+    setCaptureCenter(center: Vec3) {
+        const values = {
+            'cap-cx': center.x,
+            'cap-cy': center.y,
+            'cap-cz': center.z
+        };
+        Object.entries(values).forEach(([id, sceneValue]) => {
+            const input = this.spiralCenterInputs.get(id);
+            if (input) input.value = this.sceneToMeters(sceneValue).toFixed(4);
+        });
+    }
+
+    setCaptureRadius(kind: 'outer' | 'inner', sceneValue: number) {
+        const input = kind === 'outer' ? this.randomOuterRadiusInput : this.randomInnerCylinderInput;
+        if (input) {
+            input.value = this.sceneToMeters(sceneValue).toFixed(4);
+        }
+    }
+
+    applyVolumePoint(point: Vec3) {
+        if (!this.volumeDrag) return;
+
+        const handle = this.volumeDrag.handle;
+        if (handle === 'center') {
+            this.setCaptureCenter(point);
+        } else {
+            const center = this.spiralCenter();
+            const dx = point.x - center.x;
+            const dz = point.z - center.z;
+            const radius = Math.max(Math.sqrt(dx * dx + dz * dz), this.metersToScene(0.001));
+            if (handle === 'outer') {
+                const inner = this.randomInnerCylinderScene();
+                this.setCaptureRadius('outer', Math.max(radius, inner + this.metersToScene(0.01)));
+            } else {
+                const outer = this.randomOuterRadiusScene();
+                this.setCaptureRadius('inner', clamp(radius, 0, outer * 0.98));
+            }
+        }
+
+        this.scene.forceRender = true;
+        this.updateHandles();
+    }
+
     applyHandlePoint(point: Vec3) {
         if (!this.handleDrag) return;
 
@@ -2055,6 +2387,85 @@ class BBoxAnnotation {
         return p;
     }
 
+    drawCaptureCircle(center: Vec3, radius: number, yOffset: number, color: Color, segments = 64) {
+        if (radius <= 1e-6) return;
+        let prev = new Vec3(center.x + radius, center.y + yOffset, center.z);
+        for (let i = 1; i <= segments; i++) {
+            const theta = i / segments * Math.PI * 2;
+            const next = new Vec3(
+                center.x + Math.cos(theta) * radius,
+                center.y + yOffset,
+                center.z + Math.sin(theta) * radius
+            );
+            this.scene.app.drawLine(prev, next, color, false, this.scene.gizmoLayer);
+            prev = next;
+        }
+    }
+
+    drawCaptureArc(center: Vec3, radius: number, azimuth: number, color: Color, segments = 32) {
+        const cosA = Math.cos(azimuth);
+        const sinA = Math.sin(azimuth);
+        let prev = new Vec3(center.x + radius * cosA, center.y, center.z + radius * sinA);
+        for (let i = 1; i <= segments; i++) {
+            const phi = i / segments * Math.PI * 0.5;
+            const horizontal = Math.cos(phi) * radius;
+            const y = Math.sin(phi) * radius;
+            const next = new Vec3(
+                center.x + horizontal * cosA,
+                center.y + y,
+                center.z + horizontal * sinA
+            );
+            this.scene.app.drawLine(prev, next, color, false, this.scene.gizmoLayer);
+            prev = next;
+        }
+    }
+
+    drawCaptureVolume() {
+        if (!this.captureVolumeVisible) return;
+
+        let center: Vec3;
+        let outer: number;
+        let inner: number;
+        try {
+            center = this.spiralCenter();
+            outer = this.randomOuterRadiusScene();
+            inner = this.randomInnerCylinderScene();
+        } catch (err) {
+            return;
+        }
+        if (outer <= 0) return;
+
+        const clampedInner = clamp(inner, 0, Math.max(outer * 0.98, 0));
+        const latitudeSteps = 5;
+        for (let i = 0; i <= latitudeSteps; i++) {
+            const phi = i / latitudeSteps * Math.PI * 0.5;
+            const y = Math.sin(phi) * outer;
+            const r = Math.cos(phi) * outer;
+            this.drawCaptureCircle(center, r, y, captureOuterColor);
+        }
+        for (let i = 0; i < 8; i++) {
+            this.drawCaptureArc(center, outer, i / 8 * Math.PI * 2, captureOuterColor);
+        }
+
+        const topY = clampedInner > 1e-6 ? Math.sqrt(Math.max(outer * outer - clampedInner * clampedInner, 0)) : outer;
+        if (clampedInner > 1e-6) {
+            this.drawCaptureCircle(center, clampedInner, 0, captureInnerColor, 48);
+            this.drawCaptureCircle(center, clampedInner, topY, captureInnerColor, 48);
+            for (let i = 0; i < 8; i++) {
+                const theta = i / 8 * Math.PI * 2;
+                const x = Math.cos(theta) * clampedInner;
+                const z = Math.sin(theta) * clampedInner;
+                const a = new Vec3(center.x + x, center.y, center.z + z);
+                const b = new Vec3(center.x + x, center.y + topY, center.z + z);
+                this.scene.app.drawLine(a, b, captureInnerColor, false, this.scene.gizmoLayer);
+            }
+        }
+
+        this.scene.app.drawLine(center, center.clone().add(new Vec3(outer, 0, 0)), captureAxisColor, false, this.scene.gizmoLayer);
+        this.scene.app.drawLine(center, center.clone().add(new Vec3(0, outer, 0)), captureAxisColor, false, this.scene.gizmoLayer);
+        this.scene.app.drawLine(center, center.clone().add(new Vec3(0, 0, outer)), captureAxisColor, false, this.scene.gizmoLayer);
+    }
+
     draw() {
         if (!this.visible) return;
         this.readInputs(false);
@@ -2080,6 +2491,7 @@ class BBoxAnnotation {
                 this.scene.app.drawLine(a, b, activeLineColor, false, this.scene.gizmoLayer);
             });
         }
+        this.drawCaptureVolume();
     }
 
     updateHandles() {
@@ -2111,6 +2523,12 @@ class BBoxAnnotation {
             }
         }
 
+        if (!this.boxes.length) {
+            this.handleNodes.forEach(node => node.setAttribute('visibility', 'hidden'));
+            this.updateCaptureVolumeHandles(width, height);
+            return;
+        }
+
         const corners = this.corners();
         corners.forEach((corner, i) => {
             const node = this.handleNodes[i];
@@ -2126,6 +2544,54 @@ class BBoxAnnotation {
             node.setAttribute('cx', `${x}`);
             node.setAttribute('cy', `${y}`);
             node.setAttribute('r', this.handleDrag?.index === i ? '7' : '5');
+            node.setAttribute('visibility', visible ? 'visible' : 'hidden');
+        });
+
+        this.updateCaptureVolumeHandles(width, height);
+    }
+
+    updateCaptureVolumeHandles(width: number, height: number) {
+        const hide = () => {
+            this.volumeHandleNodes.forEach(node => node.setAttribute('visibility', 'hidden'));
+        };
+        if (!this.captureVolumeVisible) {
+            hide();
+            return;
+        }
+
+        let center: Vec3;
+        let outer: number;
+        let inner: number;
+        try {
+            center = this.spiralCenter();
+            outer = this.randomOuterRadiusScene();
+            inner = this.randomInnerCylinderScene();
+        } catch (err) {
+            hide();
+            return;
+        }
+
+        const points: Record<CaptureVolumeHandle, Vec3> = {
+            center,
+            outer: center.clone().add(new Vec3(outer, 0, 0)),
+            inner: center.clone().add(new Vec3(Math.min(inner, outer), 0, 0))
+        };
+        const projected = new Vec3();
+        (Object.keys(points) as CaptureVolumeHandle[]).forEach((handle) => {
+            const node = this.volumeHandleNodes.get(handle);
+            if (!node) return;
+            this.scene.camera.worldToScreen(points[handle], projected);
+            const x = projected.x * width;
+            const y = projected.y * height;
+            const visible = Number.isFinite(x) &&
+                Number.isFinite(y) &&
+                x >= -24 &&
+                y >= -24 &&
+                x <= width + 24 &&
+                y <= height + 24;
+            node.setAttribute('cx', `${x}`);
+            node.setAttribute('cy', `${y}`);
+            node.setAttribute('r', this.volumeDrag?.handle === handle ? '8' : handle === 'center' ? '7' : '6');
             node.setAttribute('visibility', visible ? 'visible' : 'hidden');
         });
     }
@@ -2488,6 +2954,44 @@ class BBoxAnnotation {
         return Math.abs(lx) <= hx && Math.abs(ly) <= hy && Math.abs(lz) <= hz;
     }
 
+    preparedBoxes(boxes = this.boxes): PreparedBox[] {
+        return boxes.map((box) => ({
+            box,
+            half: [
+                Math.max(box.size[0], 0.001) * 0.5,
+                Math.max(box.size[1], 0.001) * 0.5,
+                Math.max(box.size[2], 0.001) * 0.5
+            ],
+            rotation: rotationMatrix(box.euler[0], box.euler[1], box.euler[2])
+        }));
+    }
+
+    pointInPreparedBox(point: Vec3, prepared: PreparedBox) {
+        const box = prepared.box;
+        const r = prepared.rotation;
+        const dx = point.x - box.center[0];
+        const dy = point.y - box.center[1];
+        const dz = point.z - box.center[2];
+        if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(dz)) {
+            return false;
+        }
+
+        const lx = r[0] * dx + r[3] * dy + r[6] * dz;
+        const ly = r[1] * dx + r[4] * dy + r[7] * dz;
+        const lz = r[2] * dx + r[5] * dy + r[8] * dz;
+        const [hx, hy, hz] = prepared.half;
+        return Math.abs(lx) <= hx && Math.abs(ly) <= hy && Math.abs(lz) <= hz;
+    }
+
+    pointInPreparedBoxes(point: Vec3, boxes: PreparedBox[]) {
+        for (let i = 0; i < boxes.length; i++) {
+            if (this.pointInPreparedBox(point, boxes[i])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     boxCenterMask(width: number, height: number, radius: number, box: Box) {
         const splat = this.activeSplat();
         const binary = new Uint8ClampedArray(width * height * 4);
@@ -2573,8 +3077,94 @@ class BBoxAnnotation {
         };
     }
 
+    boxesCenterMask(width: number, height: number, radius: number, boxes = this.boxes) {
+        const splat = this.activeSplat();
+        const binary = new Uint8ClampedArray(width * height * 4);
+        if (!splat) {
+            return {
+                pixels: binary,
+                area: 0,
+                bbox: null as number[] | null,
+                projectedPoints: 0
+            };
+        }
+
+        const prepared = this.preparedBoxes(boxes);
+        const centers = splat.entity.gsplat.instance.sorter.centers as Float32Array;
+        const state = splat.splatData.getProp('state') as Uint8Array;
+        const world = splat.worldTransform;
+        const point = this.segmentPoint;
+        const projected = new Vec3();
+        const r2 = radius * radius;
+        let projectedPoints = 0;
+        let pixels = 0;
+        let x0 = width;
+        let y0 = height;
+        let x1 = -1;
+        let y1 = -1;
+
+        const mark = (x: number, y: number) => {
+            const offset = (y * width + x) * 4;
+            if (binary[offset] !== 0) return;
+            binary[offset + 0] = 255;
+            binary[offset + 1] = 255;
+            binary[offset + 2] = 255;
+            binary[offset + 3] = 255;
+            pixels++;
+            x0 = Math.min(x0, x);
+            y0 = Math.min(y0, y);
+            x1 = Math.max(x1, x);
+            y1 = Math.max(y1, y);
+        };
+
+        for (let i = 0; i < splat.splatData.numSplats; i++) {
+            if (state && (state[i] & (State.locked | State.deleted)) !== 0) {
+                continue;
+            }
+            const offset = i * 3;
+            point.set(centers[offset], centers[offset + 1], centers[offset + 2]);
+            world.transformPoint(point, point);
+            if (!this.pointInPreparedBoxes(point, prepared)) {
+                continue;
+            }
+
+            this.scene.camera.worldToScreen(point, projected);
+            const cx = Math.round(projected.x * width);
+            const cy = Math.round(projected.y * height);
+            if (!Number.isFinite(cx) || !Number.isFinite(cy) || cx < -radius || cy < -radius || cx >= width + radius || cy >= height + radius) {
+                continue;
+            }
+
+            projectedPoints++;
+            const minX = Math.max(0, cx - radius);
+            const maxX = Math.min(width - 1, cx + radius);
+            const minY = Math.max(0, cy - radius);
+            const maxY = Math.min(height - 1, cy + radius);
+            for (let y = minY; y <= maxY; y++) {
+                for (let x = minX; x <= maxX; x++) {
+                    const dx = x - cx;
+                    const dy = y - cy;
+                    if (dx * dx + dy * dy <= r2) {
+                        mark(x, y);
+                    }
+                }
+            }
+        }
+
+        for (let i = 3; i < binary.length; i += 4) {
+            if (binary[i] === 0) binary[i] = 255;
+        }
+
+        return {
+            pixels: binary,
+            area: pixels,
+            bbox: pixels > 0 ? [x0, y0, x1 - x0 + 1, y1 - y0 + 1] : null,
+            projectedPoints
+        };
+    }
+
     selectedCenterMask(width: number, height: number, radius: number) {
-        return this.boxCenterMask(width, height, radius, this.box);
+        return this.boxesCenterMask(width, height, radius);
     }
 
     overlayMask(rgb: Uint8Array, maskPixels: Uint8Array | Uint8ClampedArray, width: number, height: number) {
@@ -2642,6 +3232,8 @@ class BBoxAnnotation {
             const input = this.spiralCenterInputs.get(id);
             if (input) input.value = value.toFixed(4);
         });
+        this.scene.forceRender = true;
+        this.updateHandles();
         this.segmentMessage(`capture center set from ${this.box.id}`);
     }
 
@@ -2660,6 +3252,15 @@ class BBoxAnnotation {
         }
         if (radii?.length && this.spiralRadiiInput) {
             this.spiralRadiiInput.value = radii.map(radius => this.sceneToMeters(radius).toFixed(4)).join(',');
+        }
+    }
+
+    writeRandomInputsFromSceneValues(outerRadius: number | null, innerCylinder: number | null) {
+        if (this.randomOuterRadiusInput && Number.isFinite(outerRadius)) {
+            this.randomOuterRadiusInput.value = this.sceneToMeters(outerRadius as number).toFixed(4);
+        }
+        if (this.randomInnerCylinderInput && Number.isFinite(innerCylinder)) {
+            this.randomInnerCylinderInput.value = this.sceneToMeters(innerCylinder as number).toFixed(4);
         }
     }
 
@@ -2691,9 +3292,55 @@ class BBoxAnnotation {
         return value;
     }
 
+    randomCount() {
+        const value = Math.round(Number(this.randomCountInput.value));
+        if (!Number.isFinite(value) || value < 1 || value > 10000) {
+            throw new Error('random count must be in [1, 10000]');
+        }
+        return value;
+    }
+
+    randomOuterRadiusScene() {
+        const value = this.metersToScene(Number(this.randomOuterRadiusInput.value));
+        if (!Number.isFinite(value) || value <= 0) {
+            throw new Error('outer hemisphere radius must be positive');
+        }
+        return value;
+    }
+
+    randomInnerCylinderScene() {
+        const value = this.metersToScene(Number(this.randomInnerCylinderInput.value));
+        if (!Number.isFinite(value) || value < 0) {
+            throw new Error('inner cylinder radius must be non-negative');
+        }
+        return value;
+    }
+
     spiralPrefix(viewIndex: number, radius: number, theta: number) {
         const fixed = (value: number) => value.toFixed(3).replace('-', 'm').replace('.', 'p');
         return `spiral_${String(viewIndex).padStart(4, '0')}_r${fixed(radius)}_t${fixed(theta)}`;
+    }
+
+    randomPrefix(viewIndex: number, distanceMeters: number) {
+        const fixed = (value: number) => value.toFixed(3).replace('-', 'm').replace('.', 'p');
+        return `random_${String(viewIndex).padStart(4, '0')}_d${fixed(distanceMeters)}`;
+    }
+
+    sampleRandomDomePoint(center: Vec3, outerRadius: number, innerCylinder: number, random: () => number) {
+        const outer2 = outerRadius * outerRadius;
+        const inner2 = innerCylinder * innerCylinder;
+        const maxAttempts = 10000;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            const x = (random() * 2 - 1) * outerRadius;
+            const y = random() * outerRadius;
+            const z = (random() * 2 - 1) * outerRadius;
+            const d2 = x * x + y * y + z * z;
+            const horizontal2 = x * x + z * z;
+            if (d2 <= outer2 && horizontal2 >= inner2) {
+                return center.clone().add(new Vec3(x, y, z));
+            }
+        }
+        throw new Error('failed to sample random point; reduce inner cylinder or increase outer radius');
     }
 
     async runSpiralExport() {
@@ -2783,12 +3430,108 @@ class BBoxAnnotation {
         }
     }
 
-    currentViewPayload(width: number, height: number, masks: ViewMask[] = [], maskRadius = this.maskRadiusPx(), prefix = 'current') {
+    async runRandomDomeExport() {
+        if (this.spiralRunning) {
+            this.spiralRunning = false;
+            this.segmentMessage('random export: stopping after current view...');
+            return;
+        }
+
+        this.readInputs();
+        if (!this.outputDirHandle && (window as any).showDirectoryPicker) {
+            await this.chooseOutputFolder();
+        }
+
+        const dirHandle = this.outputDirHandle;
+        const center = this.spiralCenter();
+        const count = this.randomCount();
+        const outerRadius = this.randomOuterRadiusScene();
+        const innerCylinder = this.randomInnerCylinderScene();
+        if (innerCylinder >= outerRadius) {
+            throw new Error('inner cylinder radius must be smaller than outer hemisphere radius');
+        }
+
+        const seed = this.randomSeedInput.value.trim();
+        const random = seed ? seededRandom(seed) : Math.random;
+        const centerMeters = [this.sceneToMeters(center.x), this.sceneToMeters(center.y), this.sceneToMeters(center.z)];
+        const outerMeters = this.sceneToMeters(outerRadius);
+        const innerMeters = this.sceneToMeters(innerCylinder);
+        const manifest: any = {
+            description: 'Random dome renderer-view RGB/mask export from SuperSplat labeler',
+            sampling: 'uniform rejection samples inside upper hemisphere, excluding inner vertical cylinder',
+            units: 'meters',
+            metric_scale: {
+                meters_per_scene_unit: this.metersPerSceneUnit,
+                scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
+            },
+            center: centerMeters,
+            center_scene: [center.x, center.y, center.z],
+            outer_hemisphere_radius: outerMeters,
+            outer_hemisphere_radius_scene: outerRadius,
+            inner_cylinder_radius: innerMeters,
+            inner_cylinder_radius_scene: innerCylinder,
+            count,
+            seed: seed || null,
+            boxes: this.payload().boxes,
+            views: []
+        };
+
+        this.spiralRunning = true;
+        let viewIndex = 0;
+        try {
+            for (let i = 0; i < count; i++) {
+                if (!this.spiralRunning) break;
+
+                const position = this.sampleRandomDomePoint(center, outerRadius, innerCylinder, random);
+                const dx = position.x - center.x;
+                const dy = position.y - center.y;
+                const dz = position.z - center.z;
+                const distanceScene = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                const horizontalScene = Math.sqrt(dx * dx + dz * dz);
+                const azimuth = Math.atan2(dz, dx) / Math.PI * 180;
+                const elevation = Math.atan2(dy, horizontalScene) / Math.PI * 180;
+
+                this.scene.camera.setPose(position, center, 0);
+                this.scene.forceRender = true;
+
+                const distanceMeters = this.sceneToMeters(distanceScene);
+                const prefix = this.randomPrefix(viewIndex, distanceMeters);
+                this.segmentMessage(`random export: ${viewIndex + 1}/${count}, d=${distanceMeters.toFixed(3)}m`);
+                const result = await this.captureViewSet(prefix, dirHandle);
+                manifest.views.push({
+                    index: viewIndex,
+                    prefix,
+                    distance: distanceMeters,
+                    distance_scene: distanceScene,
+                    horizontal_distance: this.sceneToMeters(horizontalScene),
+                    horizontal_distance_scene: horizontalScene,
+                    azimuth_degrees: azimuth,
+                    elevation_degrees: elevation,
+                    camera_position: [this.sceneToMeters(position.x), this.sceneToMeters(position.y), this.sceneToMeters(position.z)],
+                    camera_position_scene: [position.x, position.y, position.z],
+                    target: centerMeters,
+                    target_scene: [center.x, center.y, center.z],
+                    result
+                });
+                viewIndex++;
+
+                await new Promise((resolve) => {
+                    setTimeout(resolve, 0);
+                });
+            }
+        } finally {
+            this.spiralRunning = false;
+            await this.writeTextFile('random_dome_manifest.json', JSON.stringify(manifest, null, 2), dirHandle);
+            this.segmentMessage(`random export done: ${formatCount(viewIndex)} views`);
+        }
+    }
+
+    currentViewPayload(width: number, height: number, mask: ViewMask | null = null, maskRadius = this.maskRadiusPx(), prefix = 'current') {
         this.readInputs();
         const camera = this.scene.camera.camera;
         const cameraTransform = this.scene.camera.mainCamera.getWorldTransform();
         return {
-            description: 'Current SuperSplat renderer-view annotation. Coordinates are screen pixels in this captured view.',
+            description: 'Current SuperSplat renderer-view annotation. Coordinates are screen pixels in this captured view. Segmentation mask is one union of all bbox-derived selected splats.',
             units: 'meters',
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
@@ -2798,7 +3541,8 @@ class BBoxAnnotation {
                 width,
                 height,
                 rgb_file: `${prefix}_rgb.png`,
-                overlay_file: `${prefix}_overlay.png`
+                overlay_file: `${prefix}_overlay.png`,
+                mask_file: `${prefix}_mask.png`
             },
             camera: {
                 world_matrix: Array.from(cameraTransform.data),
@@ -2809,23 +3553,27 @@ class BBoxAnnotation {
                 far: camera.farClip,
                 orthographic: this.scene.camera.ortho
             },
+            segmentation: {
+                type: 'bbox_union_selected_gaussian_center_disk_mask',
+                mask_file: mask?.maskFile ?? `${prefix}_mask.png`,
+                mask_radius_px: maskRadius,
+                mask_area_pixels: mask?.area ?? 0,
+                mask_bbox_xywh: mask?.bbox ?? null,
+                projected_selected_centers: mask?.projectedPoints ?? 0,
+                source_box_count: this.boxes.length
+            },
             annotations: this.boxes.map((box, index) => {
                 const active = index === this.activeBoxIndex;
-                const mask = masks[index] ?? null;
                 const viewBox = this.currentViewBoxForBox(width, height, box);
                 const metric = this.boxMetric(box);
                 return {
                     id: box.id,
                     label: box.label,
                     active,
-                    type: 'selected_gaussian_center_disk_mask',
-                    mask_file: mask?.maskFile ?? `${prefix}_${safeFilePart(box.id)}_mask.png`,
-                    mask_radius_px: maskRadius,
-                    mask_area_pixels: mask?.area ?? 0,
-                    mask_bbox_xywh: mask?.bbox ?? null,
+                    type: 'bbox3d_union_source',
+                    contributes_to_mask_file: mask?.maskFile ?? `${prefix}_mask.png`,
                     projected_box_xywh: viewBox?.bbox ?? null,
                     projected_box_visible_corners: viewBox?.visibleCorners ?? 0,
-                    projected_selected_centers: mask?.projectedPoints ?? 0,
                     box3d: {
                         center: metric.center,
                         size: metric.size,
@@ -2864,56 +3612,38 @@ class BBoxAnnotation {
             this.events.fire('setSelectedClr', captureSelectedClr);
             const rgb = await this.events.invoke('render.offscreen', width, height) as Uint8Array;
             const radius = this.maskRadiusPx();
-            const masks: ViewMask[] = this.boxes.map((box, index) => {
-                const mask = this.boxCenterMask(width, height, radius, box);
-                return {
-                    box,
-                    maskFile: `${prefix}_${String(index + 1).padStart(2, '0')}_${safeFilePart(box.id)}_mask.png`,
-                    area: mask.area,
-                    bbox: mask.bbox,
-                    projectedPoints: mask.projectedPoints,
-                    pixels: mask.pixels
-                };
-            });
-            const unionMask = new Uint8ClampedArray(width * height * 4);
-            masks.forEach((mask) => {
-                for (let i = 0; i < unionMask.length; i += 4) {
-                    if (mask.pixels[i] > 0) {
-                        unionMask[i + 0] = 255;
-                        unionMask[i + 1] = 255;
-                        unionMask[i + 2] = 255;
-                    }
-                    unionMask[i + 3] = 255;
-                }
-            });
-            const overlay = this.overlayMask(rgb, unionMask, width, height);
+            const union = this.boxesCenterMask(width, height, radius);
+            const mask: ViewMask = {
+                maskFile: `${prefix}_mask.png`,
+                area: union.area,
+                bbox: union.bbox,
+                projectedPoints: union.projectedPoints,
+                pixels: union.pixels
+            };
+            const overlay = this.overlayMask(rgb, mask.pixels, width, height);
 
-            const [rgbBlob, overlayBlob, ...maskBlobs] = await Promise.all([
+            const [rgbBlob, overlayBlob, maskBlob] = await Promise.all([
                 rgbaToPngBlob(rgb, width, height),
                 rgbaToPngBlob(overlay, width, height),
-                ...masks.map(mask => rgbaToPngBlob(mask.pixels, width, height))
+                rgbaToPngBlob(mask.pixels, width, height)
             ]);
 
             await this.writeBlobFile(`${prefix}_rgb.png`, rgbBlob, dirHandle);
             await this.writeBlobFile(`${prefix}_overlay.png`, overlayBlob, dirHandle);
-            for (let i = 0; i < masks.length; i++) {
-                await this.writeBlobFile(masks[i].maskFile, maskBlobs[i], dirHandle);
-            }
-            await this.writeTextFile(`${prefix}_annotation.json`, JSON.stringify(this.currentViewPayload(width, height, masks, radius, prefix), null, 2), dirHandle);
+            await this.writeBlobFile(mask.maskFile, maskBlob, dirHandle);
+            await this.writeTextFile(`${prefix}_annotation.json`, JSON.stringify(this.currentViewPayload(width, height, mask, radius, prefix), null, 2), dirHandle);
 
-            const totalCenters = masks.reduce((sum, mask) => sum + mask.projectedPoints, 0);
-            this.segmentMessage(`view export: ${masks.length} masks saved, ${formatCount(totalCenters)} centers`);
+            this.segmentMessage(`view export: union mask saved, ${formatCount(mask.projectedPoints)} centers from ${this.boxes.length} bboxes`);
             return {
                 prefix,
                 width,
                 height,
-                masks: masks.map(mask => ({
-                    id: mask.box.id,
+                mask: {
                     maskFile: mask.maskFile,
                     area: mask.area,
                     bbox: mask.bbox,
                     projectedPoints: mask.projectedPoints
-                }))
+                }
             };
         } finally {
             this.events.fire('setSelectedClr', savedSelectedClr);
