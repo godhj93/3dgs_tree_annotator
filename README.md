@@ -41,7 +41,16 @@ The app must be served over HTTP. Opening `app/index.html` directly from disk is
 
 The source under `supersplat/` is the customized SuperSplat app. To edit and rebuild the standalone app:
 
-Use Node.js `>=20.19.0`. If you use `nvm`:
+Use Node.js `>=20.19.0`.
+
+Option A, with conda:
+
+```bash
+conda env create -f environment.yml
+conda activate 3dgs-tree-annotator
+```
+
+Option B, with `nvm`:
 
 ```bash
 nvm install
