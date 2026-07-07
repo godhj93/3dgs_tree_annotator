@@ -1,0 +1,11 @@
+{
+  "name": "3dgs-tree-annotator",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Browser-based 3DGS tree annotation tool built on a customized SuperSplat viewer.",
+  "scripts": {
+    "serve": "python3 -m http.server 8027 --bind 0.0.0.0"
+  },
+  "license": "MIT"
+}
+

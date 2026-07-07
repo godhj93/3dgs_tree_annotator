@@ -1,0 +1,27 @@
+# Large local reconstruction assets
+*.ply
+*.splat
+*.spz
+*.sog
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+data/
+outputs/
+exports/
+renders/
+downloads/
+captures/
+
+# Python / local server noise
+__pycache__/
+.pytest_cache/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
