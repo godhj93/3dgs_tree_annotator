@@ -15,6 +15,10 @@ renders/
 downloads/
 captures/
 
+# Build/dependency outputs for source rebuilds
+supersplat/node_modules/
+supersplat/dist/
+
 # Python / local server noise
 __pycache__/
 .pytest_cache/
@@ -24,4 +28,3 @@ __pycache__/
 Thumbs.db
 .vscode/
 .idea/
-

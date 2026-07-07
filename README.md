@@ -10,7 +10,12 @@ This repository packages a customized SuperSplat viewer that can:
 - export the current renderer view as RGB plus per-box mask images
 - run spiral camera capture around a chosen point with configurable radii and angle step
 
+The built standalone app lives in `app/`. The editable customized SuperSplat source lives in `supersplat/`.
+
 ## Run
+
+Running the already-built app does not require `npm install` or `node_modules`.
+Only Python is needed to serve the static files:
 
 From this repository root:
 
@@ -31,6 +36,35 @@ http://localhost:8027/app/?load=../path/to/model.ply&filename=model.ply&control=
 ```
 
 The app must be served over HTTP. Opening `app/index.html` directly from disk is not reliable because the browser needs to fetch `.ply`, `.wasm`, and app assets.
+
+## Develop / Rebuild
+
+The source under `supersplat/` is the customized SuperSplat app. To edit and rebuild the standalone app:
+
+Use Node.js `>=20.19.0`. If you use `nvm`:
+
+```bash
+nvm install
+nvm use
+```
+
+```bash
+cd supersplat
+npm ci
+npm run build
+cd ..
+bash scripts/sync_app_from_supersplat.sh
+```
+
+Or from the repository root:
+
+```bash
+npm run build:app
+```
+
+This rebuilds `supersplat/dist/` and copies it into `app/`.
+
+`supersplat/package-lock.json` is committed, so `npm ci` recreates the same dependency versions on another machine. Do not commit `supersplat/node_modules/` or `supersplat/dist/`; both are generated and ignored. Commit the changed source files under `supersplat/src/` and the refreshed built app under `app/`.
 
 ## Annotation Workflow
 
@@ -84,4 +118,3 @@ Do not commit datasets, trained models, exports, or PLY files to this repository
 ## Credits
 
 This tool is based on SuperSplat by PlayCanvas and includes a customized annotation panel for 3DGS tree labeling.
-

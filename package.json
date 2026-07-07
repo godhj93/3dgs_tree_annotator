@@ -4,8 +4,11 @@
   "private": false,
   "description": "Browser-based 3DGS tree annotation tool built on a customized SuperSplat viewer.",
   "scripts": {
-    "serve": "python3 -m http.server 8027 --bind 0.0.0.0"
+    "serve": "python3 -m http.server 8027 --bind 0.0.0.0",
+    "build:app": "bash scripts/build_app.sh"
+  },
+  "engines": {
+    "node": ">=20.19.0"
   },
   "license": "MIT"
 }
-
