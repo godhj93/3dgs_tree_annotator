@@ -1,4 +1,4 @@
-import { Container, Label, NumericInput } from '@playcanvas/pcui';
+import { Button, Container, Label, NumericInput } from '@playcanvas/pcui';
 import { Entity, Mat4, Quat, TranslateGizmo, Vec3 } from 'playcanvas';
 
 import { EntityTransformOp } from '../edit-ops';
@@ -19,6 +19,11 @@ const r = new Quat();
 const s = new Vec3();
 
 const t = new Transform();
+
+const metricScale = (events: Events) => {
+    const value = Number(events.invoke('metric.metersPerSceneUnit'));
+    return Number.isFinite(value) && value > 0 ? value : 1;
+};
 
 class MeasureTransformHandler {
     activate() {}
@@ -78,7 +83,27 @@ class MeasureTool {
             min: 0.0001,
             value: 0
         });
+        lengthInput.dom.title = 'Measured length in calibrated meters. Edit this value, then press Apply Scale.';
+
+        const rawLabel = new Label({ text: 'scene' });
+        const rawLengthInput = new NumericInput({
+            width: 78,
+            precision: 4,
+            min: 0,
+            value: 0
+        });
+        rawLengthInput.enabled = false;
+        rawLengthInput.dom.title = 'Raw unscaled scene length.';
+
+        const applyScaleButton = new Button({
+            text: 'Apply Scale',
+            class: 'select-toolbar-button'
+        });
+        applyScaleButton.dom.title = 'Set meters per scene unit from the current measured scene length and the edited meter value.';
+        applyScaleButton.enabled = false;
+
         let suppressUI = 0;
+        let measuredSceneLength = 0;
 
         const selectToolbar = new Container({
             class: 'select-toolbar',
@@ -91,6 +116,9 @@ class MeasureTool {
 
         selectToolbar.append(lengthLabel);
         selectToolbar.append(lengthInput);
+        selectToolbar.append(rawLabel);
+        selectToolbar.append(rawLengthInput);
+        selectToolbar.append(applyScaleButton);
         canvasContainer.append(selectToolbar);
 
         const gizmo = new TranslateGizmo(scene.camera.camera, scene.gizmoLayer);
@@ -127,13 +155,21 @@ class MeasureTool {
                 getPoint(0, p0);
                 getPoint(1, p1);
                 const len = p0.distance(p1);
+                measuredSceneLength = len;
 
                 suppressUI++;
-                lengthInput.value = len;
+                lengthInput.value = len * metricScale(events);
+                rawLengthInput.value = len;
                 lengthInput.enabled = true;
+                rawLengthInput.enabled = true;
+                applyScaleButton.enabled = true;
                 suppressUI--;
+                events.fire('measure.length.changed', len, len * metricScale(events));
             } else {
+                measuredSceneLength = 0;
                 lengthInput.enabled = false;
+                rawLengthInput.enabled = false;
+                applyScaleButton.enabled = false;
             }
         };
 
@@ -151,6 +187,10 @@ class MeasureTool {
 
         gizmo.on('transform:end', () => {
             events.invoke('pivot').end();
+        });
+
+        events.on('metric.scale.changed', () => {
+            updateVisuals();
         });
 
         events.on('selection.changed', (selection: Splat) => {
@@ -248,18 +288,28 @@ class MeasureTool {
 
         let dragging = false;
 
-        // handle length input updates
+        applyScaleButton.on('click', () => {
+            if (measuredSceneLength <= 0) {
+                return;
+            }
+            const actualMeters = Number(lengthInput.value);
+            if (!Number.isFinite(actualMeters) || actualMeters <= 0) {
+                return;
+            }
+            events.fire('metric.scale.set', actualMeters / measuredSceneLength, 'measure-tool');
+            updateVisuals();
+        });
+
+        // Keep the original scale-by-measure behavior only while dragging the numeric slider.
         lengthInput.on('slider:mousedown', () => {
             startScale();
             dragging = true;
         });
         lengthInput.on('change', (value) => {
             if (dragging) {
-                applyLength(value);
-            } else if (!suppressUI) {
-                startScale();
-                applyLength(value);
-                endScale();
+                applyLength(value / metricScale(events));
+            } else if (!suppressUI && measuredSceneLength > 0) {
+                events.fire('measure.length.changed', measuredSceneLength, Number(value));
             }
         });
         lengthInput.on('slider:mouseup', () => {

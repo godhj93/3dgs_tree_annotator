@@ -78,11 +78,14 @@ This rebuilds `supersplat/dist/` and copies it into `app/`.
 ## Annotation Workflow
 
 1. Load a 3DGS `.ply`.
-2. Use `Place 10cm Cube` or numeric fields to place a 3D bbox.
-3. Use `Add BBox` / `Remove BBox` for multiple labels.
-4. Adjust bbox center, size, and Euler rotation.
-5. Set `View mask` radius in pixels.
-6. Click `Export View RGB+Mask` for the current renderer camera.
+2. Calibrate scale if needed: use the `Measurement` tool, measure a known length, type the real length in meters, then click `Apply Scale`.
+3. Use `Place 10cm Cube` or numeric fields to place a 3D bbox.
+4. Use `Add BBox` / `Remove BBox` for multiple labels.
+5. Adjust bbox center, size, and Euler rotation.
+6. Set `View mask` radius in pixels.
+7. Click `Export View RGB+Mask` for the current renderer camera.
+
+After scale calibration, bbox center/size fields and spiral capture radii are shown and edited in meters. Exports include both calibrated meter values and raw scene-unit values.
 
 Exported current-view files:
 

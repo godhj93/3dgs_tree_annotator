@@ -71,6 +71,7 @@ const activeLineColor = new Color(0.1, 0.7, 1, 1);
 const defaultCubeMeters = 0.1;
 const defaultMaskRadiusPx = 2;
 const segmentDebounceMs = 100;
+const metricStorageKey = '3dgs-tree-annotator:meters-per-scene-unit';
 
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
 const deg = (v: number) => v * Math.PI / 180;
@@ -264,6 +265,10 @@ class BBoxAnnotation {
     metersPerSceneUnit = 1;
     metricInput: HTMLInputElement;
     cubeMetersInput: HTMLInputElement;
+    calibrationMeasuredInput: HTMLInputElement;
+    calibrationActualInput: HTMLInputElement;
+    metricSummary: HTMLDivElement;
+    lastMeasuredSceneLength = 0;
     outputDirHandle: any = null;
     spiralRunning = false;
     activeBoxIndex = 0;
@@ -280,6 +285,8 @@ class BBoxAnnotation {
         this.events = events;
         this.scene = scene;
         this.canvasContainer = document.getElementById('canvas-container');
+        const url = new URL(window.location.href);
+        this.initMetricScale(url);
         this.installStyle();
         this.root = this.createPanel();
         this.previewRoot = this.createPreviewPanel();
@@ -311,16 +318,23 @@ class BBoxAnnotation {
 
         events.function('annotation.box3d', () => this.box);
         events.function('annotation.boxes3d', () => this.boxes.map(box => cloneBox(box)));
-
-        const url = new URL(window.location.href);
-        const metersPerSceneUnit = Number(url.searchParams.get('metersPerSceneUnit') ?? url.searchParams.get('mpsu'));
-        const sceneUnitsPerMeter = Number(url.searchParams.get('sceneUnitsPerMeter') ?? url.searchParams.get('supm'));
-        if (Number.isFinite(metersPerSceneUnit) && metersPerSceneUnit > 0) {
-            this.metersPerSceneUnit = metersPerSceneUnit;
-        } else if (Number.isFinite(sceneUnitsPerMeter) && sceneUnitsPerMeter > 0) {
-            this.metersPerSceneUnit = 1 / sceneUnitsPerMeter;
-        }
-        this.writeMetricInputs();
+        events.function('metric.metersPerSceneUnit', () => this.metersPerSceneUnit);
+        events.function('metric.sceneUnitsPerMeter', () => 1 / Math.max(this.metersPerSceneUnit, 1e-9));
+        events.on('metric.scale.set', (value: number, source = 'external') => {
+            this.setMetersPerSceneUnit(value, source);
+        });
+        events.on('measure.length.changed', (sceneLength: number, metersLength: number) => {
+            if (!Number.isFinite(sceneLength) || sceneLength <= 0) return;
+            this.lastMeasuredSceneLength = sceneLength;
+            if (this.calibrationMeasuredInput) {
+                this.calibrationMeasuredInput.value = sceneLength.toFixed(6);
+            }
+            if (this.calibrationActualInput && !document.activeElement?.isSameNode(this.calibrationActualInput)) {
+                this.calibrationActualInput.value = Number.isFinite(metersLength) && metersLength > 0 ?
+                    metersLength.toFixed(4) :
+                    this.sceneToMeters(sceneLength).toFixed(4);
+            }
+        });
 
         const transforms = url.searchParams.get('transforms');
         if (transforms) {
@@ -336,6 +350,79 @@ class BBoxAnnotation {
         if (metricScale) {
             this.loadMetricScale(decodeURIComponent(metricScale));
         }
+    }
+
+    initMetricScale(url: URL) {
+        const metersPerSceneUnit = Number(url.searchParams.get('metersPerSceneUnit') ?? url.searchParams.get('mpsu'));
+        const sceneUnitsPerMeter = Number(url.searchParams.get('sceneUnitsPerMeter') ?? url.searchParams.get('supm'));
+        const stored = Number(localStorage.getItem(metricStorageKey) ?? '');
+        if (Number.isFinite(metersPerSceneUnit) && metersPerSceneUnit > 0) {
+            this.metersPerSceneUnit = metersPerSceneUnit;
+        } else if (Number.isFinite(sceneUnitsPerMeter) && sceneUnitsPerMeter > 0) {
+            this.metersPerSceneUnit = 1 / sceneUnitsPerMeter;
+        } else if (Number.isFinite(stored) && stored > 0) {
+            this.metersPerSceneUnit = stored;
+        }
+    }
+
+    sceneToMeters(value: number) {
+        return value * this.metersPerSceneUnit;
+    }
+
+    metersToScene(value: number) {
+        return value / Math.max(this.metersPerSceneUnit, 1e-9);
+    }
+
+    boxMetric(box: Box) {
+        return {
+            center: box.center.map(value => this.sceneToMeters(value)),
+            size: box.size.map(value => this.sceneToMeters(value))
+        };
+    }
+
+    setMetersPerSceneUnit(value: number, source = 'manual') {
+        if (!Number.isFinite(value) || value <= 0) {
+            this.status('metric scale error: value must be positive');
+            return;
+        }
+
+        this.readInputs(false);
+        const spiralCenter = this.spiralCenterInputs?.size ? this.spiralCenter() : null;
+        let spiralRadii: number[] | null = null;
+        try {
+            spiralRadii = this.spiralRadiiInput ? this.spiralRadii() : null;
+        } catch (err) {
+            spiralRadii = null;
+        }
+        this.metersPerSceneUnit = value;
+        localStorage.setItem(metricStorageKey, `${value}`);
+        this.writeMetricInputs();
+        this.writeInputs();
+        this.writeSpiralInputsFromSceneValues(spiralCenter, spiralRadii);
+        this.events.fire('metric.scale.changed', value);
+        this.scene.forceRender = true;
+        this.drawPreviewOverlay();
+        this.updateHandles();
+        if (this.segmentActive) {
+            this.scheduleSegmentUpdate();
+        }
+        this.status(`metric scale applied from ${source}: 1 scene unit = ${value.toFixed(6)} m`);
+    }
+
+    applyScaleCalibration() {
+        const measuredScene = Number(this.calibrationMeasuredInput?.value || this.lastMeasuredSceneLength);
+        const actualMeters = Number(this.calibrationActualInput?.value);
+        if (!Number.isFinite(measuredScene) || measuredScene <= 0) {
+            this.status('calibration error: measure a length first or enter measured scene length');
+            return;
+        }
+        if (!Number.isFinite(actualMeters) || actualMeters <= 0) {
+            this.status('calibration error: actual length must be positive meters');
+            return;
+        }
+        this.lastMeasuredSceneLength = measuredScene;
+        this.setMetersPerSceneUnit(actualMeters / measuredScene, 'calibration');
+        this.calibrationActualInput.value = actualMeters.toFixed(4);
     }
 
     installStyle() {
@@ -593,11 +680,23 @@ class BBoxAnnotation {
         const bound = this.scene.bound;
         const extent = this.sceneExtent();
         const margin = extent * 0.25;
-        if (id === 'cx') return [bound.getMin().x - margin, bound.getMax().x + margin];
-        if (id === 'cy') return [bound.getMin().y - margin, bound.getMax().y + margin];
-        if (id === 'cz') return [bound.getMin().z - margin, bound.getMax().z + margin];
-        if (id.startsWith('s')) return [0.001, Math.max(extent, 0.01)];
+        if (id === 'cx') return [this.sceneToMeters(bound.getMin().x - margin), this.sceneToMeters(bound.getMax().x + margin)];
+        if (id === 'cy') return [this.sceneToMeters(bound.getMin().y - margin), this.sceneToMeters(bound.getMax().y + margin)];
+        if (id === 'cz') return [this.sceneToMeters(bound.getMin().z - margin), this.sceneToMeters(bound.getMax().z + margin)];
+        if (id.startsWith('s')) return [this.sceneToMeters(0.001), this.sceneToMeters(Math.max(extent, 0.01))];
         return [-180, 180];
+    }
+
+    isMetricInput(id: string) {
+        return id[0] === 'c' || id[0] === 's';
+    }
+
+    displayValue(id: string, value: number) {
+        return this.isMetricInput(id) ? this.sceneToMeters(value) : value;
+    }
+
+    sceneValue(id: string, value: number) {
+        return this.isMetricInput(id) ? this.metersToScene(value) : value;
     }
 
     createInput(id: string, value: string, step = '0.02') {
@@ -671,8 +770,8 @@ class BBoxAnnotation {
 
         body.append(this.label('Boxes'), this.boxSelectRow(), this.boxActionsRow());
         body.append(this.label('ID / label'), idRow);
-        body.append(this.label('Center XYZ'), this.row(['cx', 'cy', 'cz'], this.box.center, '0.02'));
-        body.append(this.label('Size XYZ'), this.row(['sx', 'sy', 'sz'], this.box.size, '0.02'));
+        body.append(this.label('Center XYZ meters'), this.row(['cx', 'cy', 'cz'], this.box.center, '0.02'));
+        body.append(this.label('Size XYZ meters'), this.row(['sx', 'sy', 'sz'], this.box.size, '0.02'));
         body.append(this.label('Euler XYZ degrees'), this.row(['rx', 'ry', 'rz'], this.box.euler, '1'));
         body.append(this.label('Metric scale'), this.metricRow());
         body.append(this.label('Segmentation'), this.segmentRow());
@@ -970,9 +1069,10 @@ class BBoxAnnotation {
         ids.forEach((id, i) => {
             const cell = document.createElement('div');
             cell.className = 'bbox-cell';
+            const value = this.displayValue(id, values[i]);
             cell.append(
-                this.createInput(id, `${values[i]}`, step),
-                this.createSlider(id, values[i], step)
+                this.createInput(id, `${value}`, step),
+                this.createSlider(id, value, step)
             );
             row.appendChild(cell);
         });
@@ -1025,8 +1125,8 @@ class BBoxAnnotation {
             const input = document.createElement('input');
             input.type = 'number';
             input.step = '0.01';
-            input.value = `${value}`;
-            input.title = String(id);
+            input.value = `${this.sceneToMeters(Number(value)).toFixed(4)}`;
+            input.title = `${String(id)} meters`;
             this.spiralCenterInputs.set(String(id), input);
             row.appendChild(input);
         });
@@ -1050,7 +1150,7 @@ class BBoxAnnotation {
         this.spiralRadiiInput = document.createElement('input');
         this.spiralRadiiInput.type = 'text';
         this.spiralRadiiInput.value = '1,2,3,4,5,6,7,8,9,10';
-        this.spiralRadiiInput.title = 'spiral radii in current scene/browser units';
+        this.spiralRadiiInput.title = 'spiral radii in meters';
         const useCenter = this.button('Use BBox Center', () => this.setSpiralCenterFromBox());
         radiiRow.append(this.spiralRadiiInput, useCenter);
 
@@ -1074,6 +1174,8 @@ class BBoxAnnotation {
     }
 
     metricRow() {
+        const wrap = document.createElement('div');
+
         const row = document.createElement('div');
         row.className = 'bbox-row two';
 
@@ -1084,11 +1186,10 @@ class BBoxAnnotation {
         this.metricInput.title = 'meters per scene unit';
         this.metricInput.placeholder = 'meters/unit';
         this.metricInput.value = `${this.metersPerSceneUnit}`;
-        this.metricInput.addEventListener('input', () => {
+        this.metricInput.addEventListener('change', () => {
             const value = Number(this.metricInput.value);
             if (Number.isFinite(value) && value > 0) {
-                this.metersPerSceneUnit = value;
-                this.status(`scale set: 1 scene unit = ${value.toFixed(4)}m`);
+                this.setMetersPerSceneUnit(value, 'manual input');
             }
         });
 
@@ -1101,7 +1202,44 @@ class BBoxAnnotation {
         this.cubeMetersInput.value = `${defaultCubeMeters}`;
 
         row.append(this.metricInput, this.cubeMetersInput);
-        return row;
+
+        const calibration = document.createElement('div');
+        calibration.className = 'bbox-row two';
+        this.calibrationMeasuredInput = document.createElement('input');
+        this.calibrationMeasuredInput.type = 'number';
+        this.calibrationMeasuredInput.step = '0.0001';
+        this.calibrationMeasuredInput.min = '0.000001';
+        this.calibrationMeasuredInput.placeholder = 'measured scene';
+        this.calibrationMeasuredInput.title = 'Raw scene length from the measure tool';
+
+        this.calibrationActualInput = document.createElement('input');
+        this.calibrationActualInput.type = 'number';
+        this.calibrationActualInput.step = '0.01';
+        this.calibrationActualInput.min = '0.000001';
+        this.calibrationActualInput.placeholder = 'actual meters';
+        this.calibrationActualInput.title = 'Real-world measured length in meters';
+        calibration.append(this.calibrationMeasuredInput, this.calibrationActualInput);
+
+        const actions = document.createElement('div');
+        actions.className = 'bbox-row two';
+        actions.append(
+            this.button('Use Last Measure', () => {
+                if (this.lastMeasuredSceneLength > 0) {
+                    this.calibrationMeasuredInput.value = this.lastMeasuredSceneLength.toFixed(6);
+                    this.calibrationActualInput.value = this.sceneToMeters(this.lastMeasuredSceneLength).toFixed(4);
+                } else {
+                    this.status('measure a length first');
+                }
+            }),
+            this.button('Apply Scale', () => this.applyScaleCalibration())
+        );
+
+        this.metricSummary = document.createElement('div');
+        this.metricSummary.className = 'bbox-status';
+
+        wrap.append(row, calibration, actions, this.metricSummary);
+        this.writeMetricInputs();
+        return wrap;
     }
 
     segmentRow() {
@@ -1310,12 +1448,14 @@ class BBoxAnnotation {
             const offset = i * 3;
             point.set(centers[offset], centers[offset + 1], centers[offset + 2]);
             world.transformPoint(point, point);
-            rows.push(`${point.x} ${point.y} ${point.z}`);
+            rows.push(`${this.sceneToMeters(point.x)} ${this.sceneToMeters(point.y)} ${this.sceneToMeters(point.z)}`);
         }
 
         const header = [
             'ply',
             'format ascii 1.0',
+            'comment coordinates are calibrated meters',
+            `comment meters_per_scene_unit ${this.metersPerSceneUnit}`,
             `element vertex ${rows.length}`,
             'property float x',
             'property float y',
@@ -1337,10 +1477,13 @@ class BBoxAnnotation {
 
     writeMetricInputs() {
         if (this.metricInput) {
-            this.metricInput.value = `${this.metersPerSceneUnit}`;
+            this.metricInput.value = `${this.metersPerSceneUnit.toFixed(8)}`;
         }
         if (this.cubeMetersInput && !this.cubeMetersInput.value) {
             this.cubeMetersInput.value = `${defaultCubeMeters}`;
+        }
+        if (this.metricSummary) {
+            this.metricSummary.textContent = `1 scene unit = ${this.metersPerSceneUnit.toFixed(6)} m, 1 m = ${(1 / Math.max(this.metersPerSceneUnit, 1e-9)).toFixed(4)} scene units`;
         }
     }
 
@@ -1350,8 +1493,12 @@ class BBoxAnnotation {
         this.box = {
             id: value('id') || 'box_001',
             label: value('label') || 'object',
-            center: [num('cx'), num('cy'), num('cz')],
-            size: [Math.max(0.001, num('sx')), Math.max(0.001, num('sy')), Math.max(0.001, num('sz'))],
+            center: [this.sceneValue('cx', num('cx')), this.sceneValue('cy', num('cy')), this.sceneValue('cz', num('cz'))],
+            size: [
+                Math.max(0.001, this.sceneValue('sx', num('sx'))),
+                Math.max(0.001, this.sceneValue('sy', num('sy'))),
+                Math.max(0.001, this.sceneValue('sz', num('sz')))
+            ],
             euler: [num('rx'), num('ry'), num('rz')]
         };
         this.boxes[this.activeBoxIndex] = cloneBox(this.box);
@@ -1364,7 +1511,11 @@ class BBoxAnnotation {
     writeInputs() {
         const set = (id: string, value: string | number) => {
             const input = this.inputs.get(id);
-            if (input) input.value = typeof value === 'number' ? value.toFixed(id.startsWith('r') ? 2 : 4) : value;
+            if (input) {
+                input.value = typeof value === 'number' ?
+                    this.displayValue(id, value).toFixed(id.startsWith('r') ? 2 : 4) :
+                    value;
+            }
         };
         set('id', this.box.id);
         set('label', this.box.label);
@@ -1432,12 +1583,12 @@ class BBoxAnnotation {
 
     syncSliders() {
         const values: Record<string, number> = {
-            cx: this.box.center[0],
-            cy: this.box.center[1],
-            cz: this.box.center[2],
-            sx: this.box.size[0],
-            sy: this.box.size[1],
-            sz: this.box.size[2],
+            cx: this.sceneToMeters(this.box.center[0]),
+            cy: this.sceneToMeters(this.box.center[1]),
+            cz: this.sceneToMeters(this.box.center[2]),
+            sx: this.sceneToMeters(this.box.size[0]),
+            sy: this.sceneToMeters(this.box.size[1]),
+            sz: this.sceneToMeters(this.box.size[2]),
             rx: this.box.euler[0],
             ry: this.box.euler[1],
             rz: this.box.euler[2]
@@ -1984,14 +2135,24 @@ class BBoxAnnotation {
         return {
             description: '3D box labels authored in SuperSplat native app',
             coordinate_system: 'Nerfstudio / exported Gaussian splat world coordinates',
-            boxes: this.boxes.map((box, index) => ({
-                id: box.id,
-                label: box.label,
-                active: index === this.activeBoxIndex,
-                center: box.center,
-                size: box.size,
-                euler_xyz_degrees: box.euler
-            }))
+            units: 'meters',
+            metric_scale: {
+                meters_per_scene_unit: this.metersPerSceneUnit,
+                scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
+            },
+            boxes: this.boxes.map((box, index) => {
+                const metric = this.boxMetric(box);
+                return {
+                    id: box.id,
+                    label: box.label,
+                    active: index === this.activeBoxIndex,
+                    center: metric.center,
+                    size: metric.size,
+                    center_scene: box.center,
+                    size_scene: box.size,
+                    euler_xyz_degrees: box.euler
+                };
+            })
         };
     }
 
@@ -2473,9 +2634,9 @@ class BBoxAnnotation {
     setSpiralCenterFromBox() {
         this.readInputs();
         const values = {
-            'cap-cx': this.box.center[0],
-            'cap-cy': this.box.center[1],
-            'cap-cz': this.box.center[2]
+            'cap-cx': this.sceneToMeters(this.box.center[0]),
+            'cap-cy': this.sceneToMeters(this.box.center[1]),
+            'cap-cz': this.sceneToMeters(this.box.center[2])
         };
         Object.entries(values).forEach(([id, value]) => {
             const input = this.spiralCenterInputs.get(id);
@@ -2484,15 +2645,37 @@ class BBoxAnnotation {
         this.segmentMessage(`capture center set from ${this.box.id}`);
     }
 
+    writeSpiralInputsFromSceneValues(center: Vec3 | null, radii: number[] | null) {
+        if (center) {
+            const current = {
+                'cap-cx': center.x,
+                'cap-cy': center.y,
+                'cap-cz': center.z
+            };
+            Object.entries(current).forEach(([id, sceneValue]) => {
+                const input = this.spiralCenterInputs.get(id);
+                if (!input || !Number.isFinite(sceneValue)) return;
+                input.value = this.sceneToMeters(sceneValue).toFixed(4);
+            });
+        }
+        if (radii?.length && this.spiralRadiiInput) {
+            this.spiralRadiiInput.value = radii.map(radius => this.sceneToMeters(radius).toFixed(4)).join(',');
+        }
+    }
+
     spiralCenter() {
         const get = (id: string) => Number(this.spiralCenterInputs.get(id)?.value ?? 0);
-        return new Vec3(get('cap-cx'), get('cap-cy'), get('cap-cz'));
+        return new Vec3(
+            this.metersToScene(get('cap-cx')),
+            this.metersToScene(get('cap-cy')),
+            this.metersToScene(get('cap-cz'))
+        );
     }
 
     spiralRadii() {
         const values = this.spiralRadiiInput.value
         .split(/[,\s]+/)
-        .map(value => Number(value))
+        .map(value => this.metersToScene(Number(value)))
         .filter(value => Number.isFinite(value) && value > 0);
         if (!values.length) {
             throw new Error('missing radii list');
@@ -2528,16 +2711,26 @@ class BBoxAnnotation {
         const dirHandle = this.outputDirHandle;
         const center = this.spiralCenter();
         const radii = this.spiralRadii();
+        const centerMeters = [this.sceneToMeters(center.x), this.sceneToMeters(center.y), this.sceneToMeters(center.z)];
+        const radiiMeters = radii.map(radius => this.sceneToMeters(radius));
         const dTheta = this.spiralThetaStep();
         const cameraPos = this.scene.camera.position.clone();
         const heightOffset = cameraPos.y - center.y;
         const startAngle = Math.atan2(cameraPos.z - center.z, cameraPos.x - center.x);
         const manifest: any = {
             description: 'Spiral renderer-view RGB/mask export from SuperSplat labeler',
-            center: [center.x, center.y, center.z],
-            radii,
+            units: 'meters',
+            metric_scale: {
+                meters_per_scene_unit: this.metersPerSceneUnit,
+                scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
+            },
+            center: centerMeters,
+            center_scene: [center.x, center.y, center.z],
+            radii: radiiMeters,
+            radii_scene: radii,
             dtheta_degrees: dTheta,
-            height_offset: heightOffset,
+            height_offset: this.sceneToMeters(heightOffset),
+            height_offset_scene: heightOffset,
             boxes: this.payload().boxes,
             views: []
         };
@@ -2559,16 +2752,20 @@ class BBoxAnnotation {
                     this.scene.camera.setPose(position, center, 0);
                     this.scene.forceRender = true;
 
-                    const prefix = this.spiralPrefix(viewIndex, radius, theta);
-                    this.segmentMessage(`spiral export: ${viewIndex + 1}/${total}, r=${radius}, theta=${theta.toFixed(1)}`);
+                    const radiusMeters = this.sceneToMeters(radius);
+                    const prefix = this.spiralPrefix(viewIndex, radiusMeters, theta);
+                    this.segmentMessage(`spiral export: ${viewIndex + 1}/${total}, r=${radiusMeters.toFixed(3)}m, theta=${theta.toFixed(1)}`);
                     const result = await this.captureViewSet(prefix, dirHandle);
                     manifest.views.push({
                         index: viewIndex,
                         prefix,
-                        radius,
+                        radius: radiusMeters,
+                        radius_scene: radius,
                         theta_degrees: theta,
-                        camera_position: [position.x, position.y, position.z],
-                        target: [center.x, center.y, center.z],
+                        camera_position: [this.sceneToMeters(position.x), this.sceneToMeters(position.y), this.sceneToMeters(position.z)],
+                        camera_position_scene: [position.x, position.y, position.z],
+                        target: centerMeters,
+                        target_scene: [center.x, center.y, center.z],
                         result
                     });
                     viewIndex++;
@@ -2592,6 +2789,11 @@ class BBoxAnnotation {
         const cameraTransform = this.scene.camera.mainCamera.getWorldTransform();
         return {
             description: 'Current SuperSplat renderer-view annotation. Coordinates are screen pixels in this captured view.',
+            units: 'meters',
+            metric_scale: {
+                meters_per_scene_unit: this.metersPerSceneUnit,
+                scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
+            },
             image: {
                 width,
                 height,
@@ -2611,6 +2813,7 @@ class BBoxAnnotation {
                 const active = index === this.activeBoxIndex;
                 const mask = masks[index] ?? null;
                 const viewBox = this.currentViewBoxForBox(width, height, box);
+                const metric = this.boxMetric(box);
                 return {
                     id: box.id,
                     label: box.label,
@@ -2624,8 +2827,10 @@ class BBoxAnnotation {
                     projected_box_visible_corners: viewBox?.visibleCorners ?? 0,
                     projected_selected_centers: mask?.projectedPoints ?? 0,
                     box3d: {
-                        center: box.center,
-                        size: box.size,
+                        center: metric.center,
+                        size: metric.size,
+                        center_scene: box.center,
+                        size_scene: box.size,
                         euler_xyz_degrees: box.euler
                     }
                 };
@@ -2729,6 +2934,7 @@ class BBoxAnnotation {
         this.readInputs();
         const lines = this.frames.map((frame) => {
             const projected = this.project(frame);
+            const metric = this.boxMetric(this.box);
             return JSON.stringify({
                 file_name: frame.file_path,
                 width: frame.width,
@@ -2737,7 +2943,18 @@ class BBoxAnnotation {
                     box3d_id: this.box.id,
                     label: this.box.label,
                     bbox: projected.bbox,
-                    visible_corners: projected.visibleCorners
+                    visible_corners: projected.visibleCorners,
+                    box3d: {
+                        center: metric.center,
+                        size: metric.size,
+                        center_scene: this.box.center,
+                        size_scene: this.box.size,
+                        euler_xyz_degrees: this.box.euler
+                    },
+                    metric_scale: {
+                        meters_per_scene_unit: this.metersPerSceneUnit,
+                        scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
+                    }
                 }] : []
             });
         });
