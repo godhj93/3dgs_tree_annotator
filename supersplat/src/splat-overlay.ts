@@ -176,7 +176,9 @@ class SplatOverlay extends Element {
         if (enabled) {
             const { material } = this;
             const splatSize = events.invoke('camera.splatSize');
-            const selectedClr = events.invoke('view.outlineSelection') ? nullClr : events.invoke('selectedClr');
+            const showSegmentationTint = !events.functions.has('annotation.showSegmentationTint') ||
+                events.invoke('annotation.showSegmentationTint');
+            const selectedClr = events.invoke('view.outlineSelection') || !showSegmentationTint ? nullClr : events.invoke('selectedClr');
             const unselectedClr = events.invoke('unselectedClr');
             const useGaussianColor = events.invoke('view.centersUseGaussianColor') ? 1.0 : 0.0;
 

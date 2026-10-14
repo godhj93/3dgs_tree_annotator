@@ -290,7 +290,7 @@ const initFileHandler = (scene: Scene, events: Events, dropTarget: HTMLElement) 
 
             // For URL-only single file, use full URL as filename
             const filename = (files.length === 1 && !mainFile.contents && mainFile.url) ?
-                mainFile.url :
+                new URL(mainFile.url, window.location.href).href :
                 mainFile.filename;
 
             const model = await scene.assetLoader.load(filename, fileSystem, animationFrame);

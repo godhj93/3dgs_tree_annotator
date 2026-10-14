@@ -152,6 +152,59 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
         }
     });
 
+    events.function('render.annotationSnapshot', async (width: number, height: number) => {
+        const camera = scene.camera;
+        if (camera.targetSizeOverride || scene.lockedRenderMode) throw new Error('Another capture is running');
+        const savedOverride = camera.poseOverride;
+        const savedOverlays = camera.renderOverlays;
+        const savedGizmos = scene.gizmoLayer.enabled;
+        const position = camera.mainCamera.getPosition().clone();
+        const rotation = camera.mainCamera.getRotation().clone();
+        try {
+            camera.poseOverride = { position, rotation, fov: 118, near: camera.near, far: camera.far };
+            camera.analysisPass = true;
+            camera.renderOverlays = false;
+            scene.gizmoLayer.enabled = false;
+            camera.startOffscreenMode(width, height);
+            const rendered = new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    handle.off();
+                    reject(new Error('Snapshot rendering timed out'));
+                }, 12000);
+                const handle = scene.events.on('postrender', () => {
+                    handle.off();
+                    clearTimeout(timer);
+                    resolve();
+                });
+            });
+            scene.forceRender = true;
+            await rendered;
+            const world = Array.from(camera.mainCamera.getWorldTransform().data);
+            const view = Array.from(camera.camera.viewMatrix.data);
+            const projection = Array.from(camera.camera.projectionMatrix.data);
+            const membership = new Uint8Array(width * height * 4);
+            const rgb = new Uint8Array(width * height * 4);
+            const { mainTarget, workTarget } = camera;
+            // Read MRT1 BEFORE copyRt overwrites its shared color texture.
+            await workTarget.colorBuffer.read(0, 0, width, height, { renderTarget: workTarget, data: membership });
+            scene.dataProcessor.copyRt(mainTarget, workTarget);
+            await workTarget.colorBuffer.read(0, 0, width, height, { renderTarget: workTarget, data: rgb });
+            flipY(membership, width, height);
+            flipY(rgb, width, height);
+            return { rgb, membership, world, view, projection,
+                position: [position.x, position.y, position.z],
+                quaternion: [rotation.x, rotation.y, rotation.z, rotation.w],
+                near: camera.near, far: camera.far };
+        } finally {
+            camera.analysisPass = false;
+            camera.poseOverride = savedOverride;
+            camera.renderOverlays = savedOverlays;
+            scene.gizmoLayer.enabled = savedGizmos;
+            camera.endOffscreenMode();
+            scene.forceRender = true;
+        }
+    });
+
     events.function('render.image', async (imageSettings: ImageSettings) => {
         events.fire('startSpinner');
 

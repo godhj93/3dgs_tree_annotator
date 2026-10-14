@@ -2,6 +2,9 @@ const vertexShader = /* glsl*/`
 #include "gsplatCommonVS"
 
 uniform sampler2D splatState;
+uniform sampler2D annotationMembership;
+uniform bool analysisPass;
+uniform bool analysisAnnotated;
 
 uniform vec4 selectedClr;
 uniform vec4 lockedClr;
@@ -87,7 +90,8 @@ void main(void) {
     // store texture coord and locked state
     texCoord_flags = vec4(
         corner.uv,
-        (vertexState & 1u) != 0u ? 1.0 : 0.0,       // selected
+        analysisPass ? ((analysisAnnotated && texelFetch(annotationMembership, splat.uv, 0).r > 0.5) ? 1.0 : 0.0) :
+            ((vertexState & 1u) != 0u ? 1.0 : 0.0), // annotation or editor selection
         (vertexState & 2u) != 0u ? 1.0 : 0.0        // locked
     );
 
@@ -135,10 +139,10 @@ void main(void) {
         color = vec4(prepareOutputFromGamma(max(color.xyz, 0.0), -center.view.z), color.w);
 
         // apply locked/selected colors
-        if ((vertexState & 2u) != 0u) {
+        if (!analysisPass && (vertexState & 2u) != 0u) {
             // locked
             color *= lockedClr;
-        } else if ((vertexState & 1u) != 0u) {
+        } else if (!analysisPass && (vertexState & 1u) != 0u) {
             // selected
             color.xyz = mix(color.xyz, selectedClr.xyz, selectedClr.a);
         }
@@ -152,6 +156,7 @@ varying mediump vec4 color;
 
 uniform bool outlineMode;
 uniform float ringSize;
+uniform bool analysisPass;
 
 #if PICK_PASS
     uniform int pickMode;           // 0: id, 1: depth estimation
@@ -188,6 +193,15 @@ void main(void) {
     #else
         mediump float norm = normExp(A);
         mediump float alpha = norm * color.a;
+
+        if (analysisPass) {
+            // All splats write their opacity to RT1, including non-annotated
+            // foreground. Premultiplied blending therefore occludes the
+            // annotated red contribution behind them just like the RGB image.
+            pcFragColor0 = vec4(color.xyz * alpha, alpha);
+            pcFragColor1 = vec4(texCoord_flags.z * alpha, 0.0, 0.0, alpha);
+            return;
+        }
 
         if (texCoord_flags.w == 0.0 && ringSize > 0.0) {
             // rings mode

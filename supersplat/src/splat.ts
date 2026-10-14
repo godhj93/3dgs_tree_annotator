@@ -104,6 +104,9 @@ class Splat extends Element {
 
             material.setDefine('SH_BANDS', `${Math.min(bands, (instance.resource as GSplatResource).shBands)}`);
             material.setParameter('splatState', this.stateTexture);
+            material.setParameter('annotationMembership', this.stateTexture);
+            material.setParameter('analysisPass', 0);
+            material.setParameter('analysisAnnotated', 0);
             material.setParameter('splatTransform', this.transformTexture);
             material.update();
         };
@@ -430,6 +433,11 @@ class Splat extends Element {
 
         // configure rings rendering
         const material = this.entity.gsplat.instance.material;
+        const membership = events.functions.has('annotation.membershipTexture') ?
+            events.invoke('annotation.membershipTexture', this) as Texture | null : null;
+        material.setParameter('analysisPass', this.scene.camera.analysisPass ? 1 : 0);
+        material.setParameter('analysisAnnotated', membership ? 1 : 0);
+        material.setParameter('annotationMembership', membership ?? this.stateTexture);
         material.setParameter('outlineMode', events.invoke('view.outlineSelection') ? 1 : 0);
         material.setParameter('ringSize', (selected && cameraOverlay && cameraMode === 'rings') ? 0.04 : 0);
 
@@ -437,8 +445,10 @@ class Splat extends Element {
         const selectedClr = events.invoke('selectedClr');
         const unselectedClr = events.invoke('unselectedClr');
         const lockedClr = events.invoke('lockedClr');
+        const showSegmentationTint = !events.functions.has('annotation.showSegmentationTint') ||
+            events.invoke('annotation.showSegmentationTint');
 
-        if (!selected) {
+        if (!selected || !showSegmentationTint) {
             material.setParameter('selectedClr', [0, 0, 0, 0]);
         } else if (events.invoke('view.outlineSelection')) {
             material.setParameter('selectedClr', [0, 0, 0, 0]);

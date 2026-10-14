@@ -50,8 +50,13 @@ class Shortcuts {
         const shortcuts = this.shortcuts;
 
         const handleEvent = (e: KeyboardEvent, down: boolean, capture: boolean) => {
-            // skip if focus is elsewhere (input fields, modals, etc.)
-            if (e.target !== document.body) return;
+            // Keep fly controls available after clicking a button in the expanded
+            // manager, while leaving text and numeric fields to receive typing.
+            const target = e.target;
+            const manager = document.querySelector('.bbox-manager.maximized');
+            const flyFromManager = target instanceof HTMLElement && !!manager?.contains(target) &&
+                !target.closest('input, textarea, select, [contenteditable="true"]');
+            if (target !== document.body && !flyFromManager) return;
 
             const isCtrlKey = e.code.startsWith('Control');
             const isShiftKey = e.code.startsWith('Shift');
@@ -59,6 +64,7 @@ class Shortcuts {
 
             for (let i = 0; i < shortcuts.length; i++) {
                 const options = shortcuts[i];
+                if (target !== document.body && !options.event?.startsWith('camera.fly.')) continue;
 
                 const ctrlMatch = isCtrlKey || checkMod(options.ctrl, !!(e.ctrlKey || e.metaKey));
                 const shiftMatch = isShiftKey || checkMod(options.shift, e.shiftKey);

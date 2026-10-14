@@ -2,13 +2,17 @@ import { Color, Mat4, Ray, Vec3 } from 'playcanvas';
 
 import { ElementType } from './element';
 import { Events } from './events';
+import { LiveView } from './live-view';
 import { Scene } from './scene';
 import { Splat } from './splat';
 import { State } from './splat-state';
 
+type BoxOperation = 'include' | 'exclude';
+
 type Box = {
     id: string;
     label: string;
+    operation: BoxOperation;
     center: [number, number, number];
     size: [number, number, number];
     euler: [number, number, number];
@@ -43,6 +47,13 @@ type ViewMask = {
     bbox: number[] | null;
     projectedPoints: number;
     pixels: Uint8ClampedArray;
+};
+
+type CaptureFiles = {
+    rgbFile: string;
+    overlayFile: string;
+    maskFile: string;
+    annotationFile: string;
 };
 
 type PreparedBox = {
@@ -88,9 +99,13 @@ const edges = [
 
 const lineColor = new Color(1, 0.08, 0.02, 1);
 const activeLineColor = new Color(0.1, 0.7, 1, 1);
+const excludeLineColor = new Color(1, 0.55, 0.05, 1);
+const activeExcludeLineColor = new Color(1, 0.82, 0.12, 1);
 const captureOuterColor = new Color(0.1, 0.85, 1, 1);
 const captureInnerColor = new Color(1, 0.78, 0.1, 1);
 const captureAxisColor = new Color(0.5, 0.95, 0.55, 1);
+const losPathColor = new Color(0.75, 0.35, 1, 1);
+const losWaypointColor = new Color(1, 0.45, 0.95, 1);
 const defaultCubeMeters = 0.1;
 const defaultMaskRadiusPx = 2;
 const segmentDebounceMs = 100;
@@ -211,6 +226,7 @@ const formatCount = (value: number) => value.toLocaleString(undefined, { maximum
 const cloneBox = (box: Box): Box => ({
     id: box.id,
     label: box.label,
+    operation: box.operation === 'exclude' ? 'exclude' : 'include',
     center: [box.center[0], box.center[1], box.center[2]],
     size: [box.size[0], box.size[1], box.size[2]],
     euler: [box.euler[0], box.euler[1], box.euler[2]]
@@ -232,10 +248,13 @@ const seededRandom = (seed: string) => {
 };
 
 class BBoxAnnotation {
+    liveView: LiveView;
     events: Events;
     scene: Scene;
     root: HTMLDivElement;
-    previewRoot: HTMLDivElement;
+    managerRoot: HTMLDivElement;
+    boxManagerList: HTMLDivElement;
+    boxManagerStatus: HTMLDivElement;
     previewImage: HTMLImageElement;
     previewCanvas: HTMLCanvasElement;
     previewStatus: HTMLDivElement;
@@ -245,6 +264,7 @@ class BBoxAnnotation {
     useSplatTransformInput: HTMLInputElement;
     showSegmentProjectionInput: HTMLInputElement;
     boxSelect: HTMLSelectElement;
+    boxOperationSelect: HTMLSelectElement;
     drawButton: HTMLButtonElement;
     cubeButton: HTMLButtonElement;
     autoSegmentInput: HTMLInputElement;
@@ -256,6 +276,8 @@ class BBoxAnnotation {
     randomOuterRadiusInput: HTMLInputElement;
     randomInnerCylinderInput: HTMLInputElement;
     randomSeedInput: HTMLInputElement;
+    losStepsInput: HTMLInputElement;
+    losWaypointStatus: HTMLDivElement;
     outputStatus: HTMLDivElement;
     segmentStatus: HTMLDivElement;
     canvasContainer: HTMLElement | null;
@@ -303,6 +325,7 @@ class BBoxAnnotation {
     drawRay = new Ray();
     drawDepth = 0.1;
     metersPerSceneUnit = 1;
+    metricScalePinnedByUrl = false;
     metricInput: HTMLInputElement;
     cubeMetersInput: HTMLInputElement;
     calibrationMeasuredInput: HTMLInputElement;
@@ -311,13 +334,16 @@ class BBoxAnnotation {
     lastMeasuredSceneLength = 0;
     outputDirHandle: any = null;
     spiralRunning = false;
+    losWaypoints: Vec3[] = [];
     captureVolumeVisible = false;
     captureVolumeButton: HTMLButtonElement;
     activeBoxIndex = 0;
+    deleteArmedIndex: number | null = null;
     boxUndoStack: BoxHistorySnapshot[] = [];
     box: Box = {
         id: 'branch_001',
         label: 'branch',
+        operation: 'include',
         center: [0, 0, 0],
         size: [1, 1, 1],
         euler: [0, 0, 0]
@@ -332,9 +358,22 @@ class BBoxAnnotation {
         this.initMetricScale(url);
         this.installStyle();
         this.root = this.createPanel();
-        this.previewRoot = this.createPreviewPanel();
+        this.managerRoot = this.createBoxManagerPanel();
         document.body.appendChild(this.root);
-        document.body.appendChild(this.previewRoot);
+        document.body.appendChild(this.managerRoot);
+        this.liveView = new LiveView(events, scene, this.managerRoot, () => {
+            this.readInputs(false);
+            const boxes = this.boxes.map(box => cloneBox(box));
+            const { include, exclude } = this.preparedSegmentationBoxes(boxes);
+            return {
+                splat: this.activeSplat(),
+                boxes,
+                metersPerSceneUnit: this.metersPerSceneUnit,
+                contains: (point: Vec3) => this.pointInSegmentationBoxes(point, include, exclude)
+            };
+        }, () => this.outputDirHandle, () => this.chooseOutputFolder(),
+        (name, blob, folder) => this.writeBlobFile(name, blob, folder));
+        events.function('annotation.batchCaptureRunning', () => this.spiralRunning);
         this.handleSvg = this.createHandleOverlay();
         if (this.canvasContainer && this.handleSvg) {
             this.canvasContainer.appendChild(this.handleSvg);
@@ -390,8 +429,12 @@ class BBoxAnnotation {
             this.loadDataparserTransforms(decodeURIComponent(dataparserTransforms));
         }
         const metricScale = url.searchParams.get('metricScale') ?? url.searchParams.get('metric-scale');
-        if (metricScale) {
-            this.loadMetricScale(decodeURIComponent(metricScale));
+        const metricScalePromise = metricScale ? this.loadMetricScale(decodeURIComponent(metricScale)) : Promise.resolve();
+        const boxes3d = url.searchParams.get('boxes3d');
+        if (boxes3d) {
+            metricScalePromise.then(() => this.load3DFromUrl(boxes3d)).catch((err) => {
+                this.segmentMessage(`3D import error: ${err instanceof Error ? err.message : String(err)}`);
+            });
         }
     }
 
@@ -508,6 +551,28 @@ class BBoxAnnotation {
                 display: flex;
                 flex-direction: column;
             }
+            .bbox-manager.maximized {
+                top: 12px;
+                right: 12px;
+                bottom: 12px;
+                left: calc(50vw + 6px);
+                width: calc(50vw - 18px) !important;
+                height: calc(100vh - 24px) !important;
+                max-height: none !important;
+                z-index: 40;
+            }
+            body.bbox-manager-camera-split #sensor-frame {
+                width: 50vw;
+                align-self: flex-start;
+            }
+            .bbox-manager.maximized .bbox-preview-body {
+                height: calc(100% - 39px);
+                max-height: none;
+                overflow-y: auto;
+            }
+            .bbox-manager.maximized .bbox-preview-resize { display: none; }
+            .bbox-preview.collapsed { height: auto !important; min-height: 0; top: auto; }
+            .bbox-preview.collapsed .bbox-preview-body { display: none !important; }
             .bbox-head,
             .bbox-preview-head {
                 display: flex;
@@ -716,10 +781,148 @@ class BBoxAnnotation {
             .bbox-preview.resizing {
                 user-select: none;
             }
+            .bbox-manager .bbox-preview-body {
+                display: flex;
+                flex-direction: column;
+                min-height: 210px;
+                max-height: calc(100vh - 90px);
+            }
+            .bbox-manager-summary {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                color: #ccd6df;
+                margin-bottom: 8px;
+            }
+            .bbox-manager-count {
+                color: #55c7ff;
+                font-weight: 700;
+            }
+            .bbox-manager-toolbar {
+                display: grid;
+                grid-template-columns: 1fr 1.25fr 0.75fr;
+                gap: 6px;
+                margin-bottom: 8px;
+            }
+            .bbox-manager-actions {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 6px;
+            }
+            .bbox-manager-list {
+                display: flex;
+                flex: 1 1 auto;
+                flex-direction: column;
+                gap: 7px;
+                min-height: 150px;
+                max-height: min(52vh, 520px);
+                overflow-y: auto;
+                overscroll-behavior: contain;
+                padding-right: 3px;
+                scrollbar-width: thin;
+            }
+            .bbox-preview.resized .bbox-manager-list {
+                max-height: none;
+            }
+            .bbox-manager-item {
+                flex: 0 0 auto;
+                padding: 9px;
+                border: 1px solid #2b3d4f;
+                border-radius: 7px;
+                background: rgba(8, 13, 18, 0.82);
+                cursor: pointer;
+                outline: none;
+            }
+            .bbox-manager-item:hover,
+            .bbox-manager-item:focus-visible {
+                border-color: #60768d;
+                background: rgba(18, 29, 40, 0.94);
+            }
+            .bbox-manager-item.active {
+                border-color: #55c7ff;
+                box-shadow: inset 3px 0 0 #55c7ff;
+                background: rgba(18, 45, 61, 0.9);
+            }
+            .bbox-manager-item-head {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                margin-bottom: 5px;
+            }
+            .bbox-manager-name {
+                min-width: 0;
+                overflow: hidden;
+                color: #f3f7fa;
+                font-weight: 700;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .bbox-manager-label {
+                flex: 0 0 auto;
+                max-width: 40%;
+                overflow: hidden;
+                padding: 2px 6px;
+                border-radius: 999px;
+                color: #bfeaff;
+                background: rgba(85, 199, 255, 0.12);
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .bbox-manager-label.exclude {
+                color: #ffd497;
+                background: rgba(255, 140, 20, 0.16);
+            }
+            .bbox-manager-item.exclude:not(.active) {
+                border-color: rgba(255, 140, 20, 0.55);
+            }
+            .bbox-manager-meta {
+                margin-bottom: 7px;
+                color: #91a3b3;
+                font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            }
+            .bbox-manager-actions button.danger {
+                color: #ffb5ad;
+                border-color: #704038;
+                background: #321c1a;
+            }
+            .bbox-manager-actions button.danger:hover {
+                color: #fff1ef;
+                border-color: #c76559;
+                background: #512823;
+            }
+            .bbox-manager-empty {
+                display: grid;
+                flex: 1 1 auto;
+                min-height: 150px;
+                place-items: center;
+                padding: 20px;
+                border: 1px dashed #334658;
+                border-radius: 7px;
+                color: #91a3b3;
+                text-align: center;
+            }
+            .bbox-manager-status {
+                color: #aab8c5;
+                margin-top: 8px;
+                min-height: 17px;
+            }
             .bbox-draw-hint {
                 color: #55c7ff;
             }
             @media (max-width: 820px) {
+                body.bbox-manager-camera-split #sensor-frame {
+                    width: 100%;
+                    height: 44vh;
+                    flex: 0 0 44vh;
+                }
+                .bbox-manager.maximized {
+                    top: calc(44vh + 6px);
+                    left: 12px;
+                    width: calc(100vw - 24px) !important;
+                    height: calc(56vh - 18px) !important;
+                }
                 .bbox-preview {
                     right: 12px;
                     bottom: 260px;
@@ -839,6 +1042,7 @@ class BBoxAnnotation {
         idRow.append(this.createInput('id', this.box.id), this.createInput('label', this.box.label));
 
         body.append(this.label('Boxes'), this.boxSelectRow(), this.boxActionsRow());
+        body.append(this.label('Segmentation role'), this.boxOperationRow());
         body.append(this.label('ID / label'), idRow);
         body.append(this.label('Center XYZ meters'), this.row(['cx', 'cy', 'cz'], this.box.center, '0.02'));
         body.append(this.label('Size XYZ meters'), this.row(['sx', 'sy', 'sz'], this.box.size, '0.02'));
@@ -893,8 +1097,11 @@ class BBoxAnnotation {
         );
 
         const exportRow = document.createElement('div');
-        exportRow.className = 'bbox-row two';
+        exportRow.className = 'bbox-row';
         exportRow.append(
+            this.button('Import 3D', () => {
+                this.import3D().catch(err => this.segmentMessage(`3D import error: ${err instanceof Error ? err.message : String(err)}`));
+            }),
             this.button('Export 3D', () => this.export3D()),
             this.button('Export 2D', () => this.export2D())
         );
@@ -942,104 +1149,79 @@ class BBoxAnnotation {
         return root;
     }
 
-    createPreviewPanel() {
+    createBoxManagerPanel() {
         const root = document.createElement('div');
-        root.className = 'bbox-preview';
+        root.className = 'bbox-preview bbox-manager';
         this.stopPanelEvents(root);
 
         const head = document.createElement('div');
         head.className = 'bbox-preview-head';
         const title = document.createElement('span');
-        title.textContent = '2D Projection';
+        title.textContent = 'BBox Manager';
+        const maximize = document.createElement('button');
+        maximize.textContent = 'maximize';
+        maximize.setAttribute('aria-label', 'Maximize BBox Manager');
+        maximize.setAttribute('aria-pressed', 'false');
+        maximize.addEventListener('click', () => {
+            const expanded = root.classList.toggle('maximized');
+            document.body.classList.toggle('bbox-manager-camera-split', expanded);
+            if (expanded) root.classList.remove('collapsed');
+            maximize.textContent = expanded ? 'restore' : 'maximize';
+            maximize.setAttribute('aria-label', expanded ? 'Restore BBox Manager' : 'Maximize BBox Manager');
+            maximize.setAttribute('aria-pressed', String(expanded));
+            toggle.textContent = 'hide';
+            maximize.blur();
+        });
         const toggle = document.createElement('button');
         toggle.textContent = 'hide';
         toggle.addEventListener('click', () => {
+            if (!root.classList.contains('collapsed') && root.classList.contains('maximized')) {
+                root.classList.remove('maximized');
+                document.body.classList.remove('bbox-manager-camera-split');
+                maximize.textContent = 'maximize';
+                maximize.setAttribute('aria-label', 'Maximize BBox Manager');
+                maximize.setAttribute('aria-pressed', 'false');
+            }
             root.classList.toggle('collapsed');
             toggle.textContent = root.classList.contains('collapsed') ? 'show' : 'hide';
         });
-        head.append(title, toggle);
+        head.append(title, maximize, toggle);
 
         const body = document.createElement('div');
         body.className = 'bbox-preview-body';
 
-        const controls = document.createElement('div');
-        controls.className = 'bbox-preview-controls';
-        const prev = this.button('Prev', () => this.stepFrame(-1));
-        this.frameLabel = document.createElement('span');
-        this.frameLabel.className = 'bbox-frame-label';
-        this.frameLabel.textContent = 'no frames';
-        const next = this.button('Next', () => this.stepFrame(1));
-        controls.append(prev, this.frameLabel, next);
+        const summary = document.createElement('div');
+        summary.className = 'bbox-manager-summary';
+        const summaryLabel = document.createElement('span');
+        summaryLabel.textContent = 'Annotation boxes';
+        this.boxManagerStatus = document.createElement('div');
+        this.boxManagerStatus.className = 'bbox-manager-count';
+        summary.append(summaryLabel, this.boxManagerStatus);
 
-        this.frameSlider = document.createElement('input');
-        this.frameSlider.type = 'range';
-        this.frameSlider.min = '0';
-        this.frameSlider.max = '0';
-        this.frameSlider.step = '1';
-        this.frameSlider.value = '0';
-        this.frameSlider.addEventListener('input', () => {
-            this.frameIndex = Number(this.frameSlider.value);
-            this.updatePreview();
-        });
+        const toolbar = document.createElement('div');
+        toolbar.className = 'bbox-manager-toolbar';
+        toolbar.append(
+            this.button('Add +BBox', () => this.addBox('include')),
+            this.button('Add Remove BBox', () => this.addBox('exclude')),
+            this.button('Undo', () => this.undoBoxStep())
+        );
 
-        const options = document.createElement('div');
-        options.className = 'bbox-preview-options';
+        this.boxManagerList = document.createElement('div');
+        this.boxManagerList.className = 'bbox-manager-list';
+        this.boxManagerList.setAttribute('role', 'listbox');
+        this.boxManagerList.setAttribute('aria-label', '3D bounding boxes');
 
-        this.projectionModeSelect = document.createElement('select');
-        [
-            ['train-to-data', 'Projection: train -> data'],
-            ['splat-local', 'Projection: splat local'],
-            ['splat-world', 'Projection: splat world'],
-            ['local-applied', 'Projection: local + applied'],
-            ['local-applied-inverse', 'Projection: local + inv applied']
-        ].forEach(([value, text]) => {
-            const option = document.createElement('option');
-            option.value = value;
-            option.textContent = text;
-            this.projectionModeSelect.appendChild(option);
-        });
-        this.projectionModeSelect.value = this.projectionMode;
-        this.projectionModeSelect.addEventListener('change', () => {
-            this.projectionMode = this.projectionModeSelect.value as ProjectionMode;
-            this.drawPreviewOverlay();
-        });
+        const hint = document.createElement('div');
+        hint.className = 'bbox-manager-status';
+        hint.textContent = 'Select Edit to load a box into the left-side controls.';
 
-        const useTransform = document.createElement('label');
-        useTransform.className = 'bbox-check';
-        this.useSplatTransformInput = document.createElement('input');
-        this.useSplatTransformInput.type = 'checkbox';
-        this.useSplatTransformInput.checked = true;
-        this.useSplatTransformInput.addEventListener('change', () => this.drawPreviewOverlay());
-        useTransform.append(this.useSplatTransformInput, document.createTextNode('use TRANSFORM'));
-
-        const showPoints = document.createElement('label');
-        showPoints.className = 'bbox-check';
-        this.showSegmentProjectionInput = document.createElement('input');
-        this.showSegmentProjectionInput.type = 'checkbox';
-        this.showSegmentProjectionInput.checked = true;
-        this.showSegmentProjectionInput.addEventListener('change', () => this.drawPreviewOverlay());
-        showPoints.append(this.showSegmentProjectionInput, document.createTextNode('segment pts'));
-
-        const refresh = this.button('Refresh', () => this.drawPreviewOverlay());
-        options.append(this.projectionModeSelect, useTransform, showPoints, refresh);
-
-        const frame = document.createElement('div');
-        frame.className = 'bbox-preview-frame';
-        this.previewImage = document.createElement('img');
-        this.previewCanvas = document.createElement('canvas');
-        this.previewImage.addEventListener('load', () => this.drawPreviewOverlay());
-        frame.append(this.previewImage, this.previewCanvas);
-
-        this.previewStatus = document.createElement('div');
-        this.previewStatus.className = 'bbox-preview-status';
-        this.previewStatus.textContent = 'load transforms to preview 2D labels';
-
-        body.append(controls, this.frameSlider, options, frame, this.previewStatus);
+        body.append(summary, toolbar, this.boxManagerList, hint);
         const resize = document.createElement('div');
         resize.className = 'bbox-preview-resize';
         this.installPreviewResize(root, resize);
 
         root.append(head, body, resize);
+        this.syncBoxManager();
         return root;
     }
 
@@ -1079,6 +1261,7 @@ class BBoxAnnotation {
         };
 
         handle.addEventListener('pointerdown', (event) => {
+            if (root.classList.contains('maximized')) return;
             if (event.pointerType === 'mouse' && event.button !== 0) return;
             event.preventDefault();
             event.stopPropagation();
@@ -1170,20 +1353,7 @@ class BBoxAnnotation {
         this.boxSelect = document.createElement('select');
         this.boxSelect.style.width = '100%';
         this.boxSelect.addEventListener('change', () => {
-            this.readInputs();
-            if (!this.boxes.length) {
-                this.segmentMessage('active bbox: none');
-                return;
-            }
-            this.activeBoxIndex = clamp(Number(this.boxSelect.value), 0, this.boxes.length - 1);
-            this.box = cloneBox(this.boxes[this.activeBoxIndex]);
-            this.writeInputs();
-            this.scene.forceRender = true;
-            this.drawPreviewOverlay();
-            this.updateHandles();
-            this.segmentActive = true;
-            this.scheduleSegmentUpdate(0);
-            this.segmentMessage(`active bbox: ${this.box.id}; union segment stays visible`);
+            this.selectBox(Number(this.boxSelect.value));
         });
 
         const focus = this.button('Focus Box', () => this.focus());
@@ -1193,12 +1363,63 @@ class BBoxAnnotation {
 
     boxActionsRow() {
         const row = document.createElement('div');
-        row.className = 'bbox-row two';
+        row.className = 'bbox-row';
         row.append(
-            this.button('Add BBox', () => this.addBox()),
-            this.button('Remove BBox', () => this.removeBox())
+            this.button('Add +BBox', () => this.addBox('include')),
+            this.button('Add Remove BBox', () => this.addBox('exclude')),
+            this.button('Delete BBox', () => this.removeBox(this.activeBoxIndex))
         );
         return row;
+    }
+
+    boxOperationRow() {
+        const row = document.createElement('div');
+        row.className = 'bbox-row';
+        this.boxOperationSelect = document.createElement('select');
+        this.boxOperationSelect.style.gridColumn = '1 / -1';
+        [
+            ['include', 'Include (+): add to segment'],
+            ['exclude', 'Remove (-): subtract from segment']
+        ].forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            this.boxOperationSelect.appendChild(option);
+        });
+        this.boxOperationSelect.value = this.box.operation;
+        this.boxOperationSelect.addEventListener('change', () => {
+            this.touched = true;
+            this.readInputs();
+            this.scene.forceRender = true;
+            this.segmentActive = true;
+            this.scheduleSegmentUpdate(0);
+            this.segmentMessage(`${this.box.id}: segmentation role changed to ${this.box.operation}`);
+        });
+        row.append(this.boxOperationSelect);
+        return row;
+    }
+
+    selectBox(index: number, focus = false) {
+        this.readInputs(false);
+        this.deleteArmedIndex = null;
+        if (!this.boxes.length) {
+            this.segmentMessage('active bbox: none');
+            this.syncBoxSelect();
+            return;
+        }
+
+        this.activeBoxIndex = clamp(index, 0, this.boxes.length - 1);
+        this.box = cloneBox(this.boxes[this.activeBoxIndex]);
+        this.writeInputs();
+        this.scene.forceRender = true;
+        this.drawPreviewOverlay();
+        this.updateHandles();
+        this.segmentActive = true;
+        this.scheduleSegmentUpdate(0);
+        if (focus) {
+            this.focus();
+        }
+        this.segmentMessage(`editing bbox: ${this.box.id}; union segment stays visible`);
     }
 
     captureRow() {
@@ -1309,6 +1530,49 @@ class BBoxAnnotation {
                 this.runRandomDomeExport().catch(err => this.segmentMessage(`random export error: ${err.message ?? err}`));
             })
         );
+
+        const losHint = document.createElement('div');
+        losHint.className = 'bbox-status';
+        losHint.textContent = 'LOS path: save good camera positions, then interpolate position while always looking at capture center';
+
+        const losControls = document.createElement('div');
+        losControls.className = 'bbox-row two';
+        this.losStepsInput = document.createElement('input');
+        this.losStepsInput.type = 'number';
+        this.losStepsInput.step = '1';
+        this.losStepsInput.min = '1';
+        this.losStepsInput.max = '1000';
+        this.losStepsInput.value = '8';
+        this.losStepsInput.placeholder = 'steps / segment';
+        this.losStepsInput.title = 'linear interpolation steps between each adjacent waypoint';
+        this.losStepsInput.addEventListener('input', () => this.syncLosWaypointStatus());
+        losControls.append(
+            this.losStepsInput,
+            this.button('Add Current Camera', () => this.addLosWaypoint())
+        );
+
+        const losActions = document.createElement('div');
+        losActions.className = 'bbox-row two';
+        losActions.append(
+            this.button('Undo Point', () => this.undoLosWaypoint()),
+            this.button('Clear Path', () => this.clearLosWaypoints())
+        );
+
+        const losExportActions = document.createElement('div');
+        losExportActions.className = 'bbox-row two';
+        losExportActions.append(
+            this.button('Choose Output Folder', () => {
+                this.chooseOutputFolder().catch(err => this.segmentMessage(`output folder error: ${err.message ?? err}`));
+            }),
+            this.button('Run LOS Path', () => {
+                this.runLosPathExport().catch(err => this.segmentMessage(`LOS path error: ${err.message ?? err}`));
+            })
+        );
+
+        this.losWaypointStatus = document.createElement('div');
+        this.losWaypointStatus.className = 'bbox-segment-status';
+        this.syncLosWaypointStatus();
+
         const stopRow = document.createElement('div');
         stopRow.className = 'bbox-row two';
         stopRow.append(
@@ -1323,7 +1587,20 @@ class BBoxAnnotation {
         this.outputStatus.className = 'bbox-segment-status';
         this.outputStatus.textContent = 'output: browser downloads until a folder is chosen';
 
-        wrap.append(radiiRow, actions, randomHint, randomRow, randomActions, stopRow, this.outputStatus);
+        wrap.append(
+            radiiRow,
+            actions,
+            randomHint,
+            randomRow,
+            randomActions,
+            losHint,
+            losControls,
+            losActions,
+            losExportActions,
+            this.losWaypointStatus,
+            stopRow,
+            this.outputStatus
+        );
         return wrap;
     }
 
@@ -1524,10 +1801,10 @@ class BBoxAnnotation {
         const centers = splat.entity.gsplat.instance.sorter.centers as Float32Array;
         const state = splat.splatData.getProp('state') as Uint8Array;
         const world = splat.worldTransform;
-        const boxes = this.preparedBoxes();
+        const { include, exclude } = this.preparedSegmentationBoxes();
         const point = this.segmentPoint;
 
-        this.segmentMessage(`segmenting ${formatCount(total)} points across ${this.boxes.length} bboxes...`);
+        this.segmentMessage(`segmenting ${formatCount(total)} points with ${include.length} include / ${exclude.length} remove bboxes...`);
 
         const count = await this.scene.commandQueue.enqueue(async () => {
             const selectedCount = splat.state.replaceSelectedByPredicate((i) => {
@@ -1537,14 +1814,14 @@ class BBoxAnnotation {
                 const offset = i * 3;
                 point.set(centers[offset], centers[offset + 1], centers[offset + 2]);
                 world.transformPoint(point, point);
-                return this.pointInPreparedBoxes(point, boxes);
+                return this.pointInSegmentationBoxes(point, include, exclude);
             });
             await splat.updateState();
             return selectedCount;
         });
 
         this.segmentLastCount = count;
-        this.segmentMessage(`segment union: ${formatCount(count)} / ${formatCount(total)} points in ${this.boxes.length} bboxes`);
+        this.segmentMessage(`segment: ${formatCount(count)} / ${formatCount(total)} points · ${include.length} include − ${exclude.length} remove bboxes`);
     }
 
     async clearSegmentSelection() {
@@ -1633,6 +1910,7 @@ class BBoxAnnotation {
         this.box = {
             id: value('id') || 'box_001',
             label: value('label') || 'object',
+            operation: this.boxOperationSelect?.value === 'exclude' ? 'exclude' : 'include',
             center: [this.sceneValue('cx', num('cx')), this.sceneValue('cy', num('cy')), this.sceneValue('cz', num('cz'))],
             size: [
                 Math.max(0.001, this.sceneValue('sx', num('sx'))),
@@ -1661,6 +1939,9 @@ class BBoxAnnotation {
         };
         set('id', this.box.id);
         set('label', this.box.label);
+        if (this.boxOperationSelect) {
+            this.boxOperationSelect.value = this.box.operation;
+        }
         ['cx', 'cy', 'cz'].forEach((id, i) => set(id, this.box.center[i]));
         ['sx', 'sy', 'sz'].forEach((id, i) => set(id, this.box.size[i]));
         ['rx', 'ry', 'rz'].forEach((id, i) => set(id, this.box.euler[i]));
@@ -1672,7 +1953,10 @@ class BBoxAnnotation {
     }
 
     syncBoxSelect() {
-        if (!this.boxSelect) return;
+        if (!this.boxSelect) {
+            this.syncBoxManager();
+            return;
+        }
         const current = `${this.activeBoxIndex}`;
         this.boxSelect.replaceChildren();
         if (!this.boxes.length) {
@@ -1681,15 +1965,85 @@ class BBoxAnnotation {
             option.textContent = 'No bbox';
             this.boxSelect.appendChild(option);
             this.boxSelect.value = '0';
+            this.syncBoxManager();
             return;
         }
         this.boxes.forEach((box, index) => {
             const option = document.createElement('option');
             option.value = `${index}`;
-            option.textContent = `${index + 1}: ${box.id || 'bbox'} (${box.label || 'object'})`;
+            const role = box.operation === 'exclude' ? '-' : '+';
+            option.textContent = `${index + 1}: [${role}] ${box.id || 'bbox'} (${box.label || 'object'})`;
             this.boxSelect.appendChild(option);
         });
         this.boxSelect.value = current;
+        this.syncBoxManager();
+    }
+
+    syncBoxManager() {
+        if (!this.boxManagerList || !this.boxManagerStatus) return;
+
+        const scrollTop = this.boxManagerList.scrollTop;
+        this.boxManagerList.replaceChildren();
+        const includeCount = this.boxes.filter(box => box.operation !== 'exclude').length;
+        const excludeCount = this.boxes.length - includeCount;
+        this.boxManagerStatus.textContent = `${includeCount} include / ${excludeCount} remove`;
+
+        if (!this.boxes.length) {
+            const empty = document.createElement('div');
+            empty.className = 'bbox-manager-empty';
+            empty.textContent = 'No bounding boxes. Click Add BBox or draw a new box in the viewer.';
+            this.boxManagerList.appendChild(empty);
+            return;
+        }
+
+        this.boxes.forEach((box, index) => {
+            const active = index === this.activeBoxIndex;
+            const metric = this.boxMetric(box);
+            const item = document.createElement('div');
+            const operation = box.operation === 'exclude' ? 'exclude' : 'include';
+            item.className = `bbox-manager-item ${operation}${active ? ' active' : ''}`;
+            item.tabIndex = 0;
+            item.setAttribute('role', 'option');
+            item.setAttribute('aria-selected', active ? 'true' : 'false');
+
+            const itemHead = document.createElement('div');
+            itemHead.className = 'bbox-manager-item-head';
+            const name = document.createElement('span');
+            name.className = 'bbox-manager-name';
+            name.textContent = `${index + 1}. ${box.id || 'bbox'}`;
+            const label = document.createElement('span');
+            label.className = `bbox-manager-label ${operation}`;
+            label.textContent = `${operation === 'exclude' ? 'REMOVE' : 'INCLUDE'} · ${box.label || 'object'}`;
+            itemHead.append(name, label);
+
+            const meta = document.createElement('div');
+            meta.className = 'bbox-manager-meta';
+            meta.textContent = `center ${metric.center.map(value => value.toFixed(2)).join(', ')} m\nsize ${metric.size.map(value => value.toFixed(2)).join(' x ')} m`;
+            meta.style.whiteSpace = 'pre-line';
+
+            const actions = document.createElement('div');
+            actions.className = 'bbox-manager-actions';
+            const edit = this.button(active ? 'Editing' : 'Edit', () => this.selectBox(index));
+            const deleteArmed = this.deleteArmedIndex === index;
+            const remove = this.button(deleteArmed ? 'Confirm Delete' : 'Delete', () => this.armBoxDelete(index));
+            remove.classList.add('danger');
+            [edit, remove].forEach((button) => {
+                button.addEventListener('click', event => event.stopPropagation());
+            });
+            actions.append(edit, remove);
+            item.append(itemHead, meta, actions);
+
+            const select = () => this.selectBox(index);
+            item.addEventListener('click', select);
+            item.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                select();
+            });
+            this.boxManagerList.appendChild(item);
+        });
+
+        this.boxManagerList.scrollTop = scrollTop;
     }
 
     pushBoxUndo() {
@@ -1703,6 +2057,7 @@ class BBoxAnnotation {
     }
 
     restoreBoxes(snapshot: BoxHistorySnapshot) {
+        this.deleteArmedIndex = null;
         this.boxes = snapshot.boxes.map(box => cloneBox(box));
         this.activeBoxIndex = this.boxes.length ? clamp(snapshot.activeBoxIndex, 0, this.boxes.length - 1) : 0;
         if (this.boxes.length) {
@@ -1728,22 +2083,25 @@ class BBoxAnnotation {
         this.segmentMessage(`undo: restored ${this.boxes.length} bbox${this.boxes.length === 1 ? '' : 'es'}`);
     }
 
-    nextBoxId() {
+    nextBoxId(operation: BoxOperation = 'include') {
         const used = new Set(this.boxes.map(box => box.id));
         let index = this.boxes.length + 1;
-        let id = `branch_${String(index).padStart(3, '0')}`;
+        const prefix = operation === 'exclude' ? 'remove' : 'branch';
+        let id = `${prefix}_${String(index).padStart(3, '0')}`;
         while (used.has(id)) {
             index++;
-            id = `branch_${String(index).padStart(3, '0')}`;
+            id = `${prefix}_${String(index).padStart(3, '0')}`;
         }
         return id;
     }
 
-    addBox() {
+    addBox(operation: BoxOperation = 'include') {
         this.readInputs(false);
         this.pushBoxUndo();
+        this.deleteArmedIndex = null;
         const next = cloneBox(this.box);
-        next.id = this.nextBoxId();
+        next.id = this.nextBoxId(operation);
+        next.operation = operation;
         if (!this.boxes.length) {
             const size = this.cubeSceneSize();
             next.size = [size, size, size];
@@ -1765,27 +2123,47 @@ class BBoxAnnotation {
         this.updateHandles();
         this.segmentActive = true;
         this.scheduleSegmentUpdate(0);
-        this.segmentMessage(`bbox added: ${this.box.id}; union segment updated`);
+        this.segmentMessage(`${operation === 'exclude' ? 'remove' : 'include'} bbox added: ${this.box.id}; segment updated`);
     }
 
-    removeBox() {
-        if (this.boxes.length <= 1) {
-            this.segmentMessage('remove bbox: keep at least one bbox');
+    armBoxDelete(index: number) {
+        const deleteIndex = clamp(index, 0, Math.max(this.boxes.length - 1, 0));
+        if (this.deleteArmedIndex === deleteIndex) {
+            this.deleteArmedIndex = null;
+            this.removeBox(deleteIndex);
+            return;
+        }
+        this.deleteArmedIndex = deleteIndex;
+        this.syncBoxManager();
+        const candidate = this.boxes[deleteIndex];
+        this.segmentMessage(`delete bbox: click Confirm Delete for ${candidate?.id || 'bbox'}`);
+    }
+
+    removeBox(index = this.activeBoxIndex) {
+        this.readInputs(false);
+        if (!this.boxes.length) {
+            this.segmentMessage('remove bbox: no bbox selected');
             return;
         }
 
+        const removeIndex = clamp(index, 0, this.boxes.length - 1);
         this.pushBoxUndo();
-        const removed = this.boxes.splice(this.activeBoxIndex, 1)[0];
-        this.activeBoxIndex = clamp(this.activeBoxIndex, 0, this.boxes.length - 1);
-        this.box = cloneBox(this.boxes[this.activeBoxIndex]);
+        const removed = this.boxes.splice(removeIndex, 1)[0];
+        this.deleteArmedIndex = null;
+        if (this.boxes.length) {
+            this.activeBoxIndex = clamp(removeIndex, 0, this.boxes.length - 1);
+            this.box = cloneBox(this.boxes[this.activeBoxIndex]);
+        } else {
+            this.activeBoxIndex = 0;
+            this.box = cloneBox(removed);
+        }
         this.writeInputs();
-        this.syncBoxSelect();
         this.scene.forceRender = true;
         this.drawPreviewOverlay();
         this.updateHandles();
         this.segmentActive = true;
         this.scheduleSegmentUpdate(0);
-        this.segmentMessage(`bbox removed: ${removed.id}; union segment updated`);
+        this.segmentMessage(`bbox deleted: ${removed.id}; ${this.boxes.length} remaining`);
     }
 
     syncSliders() {
@@ -1962,8 +2340,9 @@ class BBoxAnnotation {
         this.pushBoxUndo();
         if (append) {
             const next: Box = {
-                id: this.nextBoxId(),
+                id: this.nextBoxId('include'),
                 label: this.box.label || 'branch',
+                operation: 'include',
                 center: [position.x, position.y, position.z],
                 size: [size, size, size],
                 euler: [0, 0, 0]
@@ -2466,14 +2845,49 @@ class BBoxAnnotation {
         this.scene.app.drawLine(center, center.clone().add(new Vec3(0, 0, outer)), captureAxisColor, false, this.scene.gizmoLayer);
     }
 
+    drawLosPath() {
+        if (!this.losWaypoints.length) return;
+
+        const marker = Math.max(this.sceneExtent() * 0.008, this.metersToScene(0.015));
+        this.losWaypoints.forEach((point, index) => {
+            if (index > 0) {
+                this.scene.app.drawLine(this.losWaypoints[index - 1], point, losPathColor, false, this.scene.gizmoLayer);
+            }
+            this.scene.app.drawLine(
+                point.clone().add(new Vec3(-marker, 0, 0)),
+                point.clone().add(new Vec3(marker, 0, 0)),
+                losWaypointColor,
+                false,
+                this.scene.gizmoLayer
+            );
+            this.scene.app.drawLine(
+                point.clone().add(new Vec3(0, -marker, 0)),
+                point.clone().add(new Vec3(0, marker, 0)),
+                losWaypointColor,
+                false,
+                this.scene.gizmoLayer
+            );
+            this.scene.app.drawLine(
+                point.clone().add(new Vec3(0, 0, -marker)),
+                point.clone().add(new Vec3(0, 0, marker)),
+                losWaypointColor,
+                false,
+                this.scene.gizmoLayer
+            );
+        });
+    }
+
     draw() {
         if (!this.visible) return;
         this.readInputs(false);
         this.boxes.forEach((box, index) => {
             const corners = this.boxCorners(box).map(p => new Vec3(p[0], p[1], p[2]));
-            const color = index === this.activeBoxIndex ? activeLineColor : lineColor;
+            const exclude = box.operation === 'exclude';
+            const color = index === this.activeBoxIndex ?
+                (exclude ? activeExcludeLineColor : activeLineColor) :
+                (exclude ? excludeLineColor : lineColor);
             edges.forEach(([a, b]) => {
-                this.scene.app.drawLine(corners[a], corners[b], this.drawing && index === this.activeBoxIndex ? activeLineColor : color, false, this.scene.gizmoLayer);
+                this.scene.app.drawLine(corners[a], corners[b], color, false, this.scene.gizmoLayer);
             });
         });
 
@@ -2491,6 +2905,7 @@ class BBoxAnnotation {
                 this.scene.app.drawLine(a, b, activeLineColor, false, this.scene.gizmoLayer);
             });
         }
+        this.drawLosPath();
         this.drawCaptureVolume();
     }
 
@@ -2599,7 +3014,7 @@ class BBoxAnnotation {
     payload() {
         this.readInputs();
         return {
-            description: '3D box labels authored in SuperSplat native app',
+            description: '3D include/remove box labels authored in SuperSplat native app. Segmentation is include union minus remove union.',
             coordinate_system: 'Nerfstudio / exported Gaussian splat world coordinates',
             units: 'meters',
             metric_scale: {
@@ -2611,6 +3026,7 @@ class BBoxAnnotation {
                 return {
                     id: box.id,
                     label: box.label,
+                    operation: box.operation,
                     active: index === this.activeBoxIndex,
                     center: metric.center,
                     size: metric.size,
@@ -2624,6 +3040,133 @@ class BBoxAnnotation {
 
     export3D() {
         downloadText('boxes_3d.json', JSON.stringify(this.payload(), null, 2));
+    }
+
+    pick3DJsonFile() {
+        return new Promise<File | null>((resolve) => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json,application/json';
+            input.style.display = 'none';
+            document.body.appendChild(input);
+
+            const finish = (file: File | null) => {
+                input.remove();
+                resolve(file);
+            };
+            input.addEventListener('change', () => finish(input.files?.[0] ?? null), { once: true });
+            input.addEventListener('cancel', () => finish(null), { once: true });
+            input.click();
+        });
+    }
+
+    async import3D() {
+        const file = await this.pick3DJsonFile();
+        if (!file) {
+            this.segmentMessage('3D import cancelled');
+            return;
+        }
+
+        let payload: any;
+        try {
+            payload = JSON.parse(await file.text());
+        } catch (err) {
+            throw new Error(`invalid JSON in ${file.name}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        this.apply3DPayload(payload, file.name);
+    }
+
+    async load3DFromUrl(url: string) {
+        const boxesUrl = new URL(url, window.location.href);
+        const response = await fetch(boxesUrl);
+        if (!response.ok) {
+            throw new Error(`could not load ${boxesUrl.pathname}: HTTP ${response.status}`);
+        }
+        this.apply3DPayload(await response.json(), boxesUrl.pathname.split('/').pop() ?? 'boxes3d');
+    }
+
+    apply3DPayload(payload: any, source: string) {
+        const rawBoxes = Array.isArray(payload) ? payload : payload?.boxes;
+        if (!Array.isArray(rawBoxes)) {
+            throw new Error('expected a boxes array');
+        }
+
+        const importedMetersPerSceneUnit = Number(
+            payload?.metric_scale?.meters_per_scene_unit ??
+            payload?.metric_scale?.metersPerSceneUnit ??
+            payload?.meters_per_scene_unit
+        );
+        const metersPerSceneUnit = Number.isFinite(importedMetersPerSceneUnit) && importedMetersPerSceneUnit > 0 ?
+            importedMetersPerSceneUnit :
+            this.metersPerSceneUnit;
+        const sceneMetricScale = this.metricScalePinnedByUrl ? this.metersPerSceneUnit : metersPerSceneUnit;
+
+        const triplet = (value: any, name: string): [number, number, number] => {
+            if (!Array.isArray(value) || value.length < 3) {
+                throw new Error(`${name} must contain three numbers`);
+            }
+            const result: [number, number, number] = [Number(value[0]), Number(value[1]), Number(value[2])];
+            if (!result.every(Number.isFinite)) {
+                throw new Error(`${name} contains a non-finite value`);
+            }
+            return result;
+        };
+
+        const imported = rawBoxes.map((raw: any, index: number) => {
+            if (!raw || typeof raw !== 'object') {
+                throw new Error(`boxes[${index}] must be an object`);
+            }
+            const operation: BoxOperation = raw.operation === 'exclude' || raw.mask_effect === 'subtract' || raw.type === 'bbox3d_remove_source' ?
+                'exclude' :
+                'include';
+            const center = Array.isArray(raw.center_scene) ?
+                triplet(raw.center_scene, `boxes[${index}].center_scene`) :
+                triplet(raw.center, `boxes[${index}].center`).map(value => value / metersPerSceneUnit) as [number, number, number];
+            const size = Array.isArray(raw.size_scene) ?
+                triplet(raw.size_scene, `boxes[${index}].size_scene`) :
+                triplet(raw.size, `boxes[${index}].size`).map(value => value / metersPerSceneUnit) as [number, number, number];
+            const euler = triplet(raw.euler_xyz_degrees ?? raw.euler ?? [0, 0, 0], `boxes[${index}].euler_xyz_degrees`);
+            const prefix = operation === 'exclude' ? 'remove' : 'branch';
+            return {
+                active: raw.active === true,
+                box: {
+                    id: typeof raw.id === 'string' && raw.id.trim() ? raw.id : `${prefix}_${String(index + 1).padStart(3, '0')}`,
+                    label: typeof raw.label === 'string' && raw.label.trim() ? raw.label : 'branch',
+                    operation,
+                    center,
+                    size: [
+                        Math.max(Math.abs(size[0]), 0.001),
+                        Math.max(Math.abs(size[1]), 0.001),
+                        Math.max(Math.abs(size[2]), 0.001)
+                    ] as [number, number, number],
+                    euler
+                } as Box
+            };
+        });
+
+        this.readInputs(false);
+        this.pushBoxUndo();
+        if (sceneMetricScale !== this.metersPerSceneUnit) {
+            this.setMetersPerSceneUnit(sceneMetricScale, `3D import ${source}`);
+        }
+        this.boxes = imported.map(entry => cloneBox(entry.box));
+        this.activeBoxIndex = Math.max(0, imported.findIndex(entry => entry.active));
+        if (this.boxes.length) {
+            this.activeBoxIndex = clamp(this.activeBoxIndex, 0, this.boxes.length - 1);
+            this.box = cloneBox(this.boxes[this.activeBoxIndex]);
+            this.drawDepth = this.box.size[2];
+        }
+        this.deleteArmedIndex = null;
+        this.touched = true;
+        this.writeInputs();
+        this.scene.forceRender = true;
+        this.drawPreviewOverlay();
+        this.updateHandles();
+        this.segmentActive = true;
+        this.scheduleSegmentUpdate(0);
+        this.status(`3D annotations imported from ${source}`);
+        this.segmentMessage(`3D import: ${this.boxes.length} boxes · ${this.boxes.filter(box => box.operation !== 'exclude').length} include / ${this.boxes.filter(box => box.operation === 'exclude').length} remove`);
     }
 
     async loadTransforms(url: string) {
@@ -2661,14 +3204,18 @@ class BBoxAnnotation {
                 transform_matrix: frame.transform_matrix
             }));
             this.frameIndex = 0;
-            this.frameSlider.min = '0';
-            this.frameSlider.max = `${Math.max(this.frames.length - 1, 0)}`;
-            this.frameSlider.value = '0';
+            if (this.frameSlider) {
+                this.frameSlider.min = '0';
+                this.frameSlider.max = `${Math.max(this.frames.length - 1, 0)}`;
+                this.frameSlider.value = '0';
+            }
             this.status(`transforms loaded: ${this.frames.length} frames`);
             this.updatePreview();
         } catch (err) {
             this.status(`transforms error: ${err instanceof Error ? err.message : String(err)}`);
-            this.previewStatus.textContent = `transforms error: ${err instanceof Error ? err.message : String(err)}`;
+            if (this.previewStatus) {
+                this.previewStatus.textContent = `transforms error: ${err instanceof Error ? err.message : String(err)}`;
+            }
         }
     }
 
@@ -2685,6 +3232,7 @@ class BBoxAnnotation {
             } else {
                 throw new Error('missing meters_per_scene_unit or scene_units_per_meter');
             }
+            this.metricScalePinnedByUrl = true;
             this.writeMetricInputs();
             this.status(`metric scale loaded: 1 scene unit = ${this.metersPerSceneUnit.toFixed(4)}m`);
         } catch (err) {
@@ -2723,11 +3271,14 @@ class BBoxAnnotation {
     stepFrame(delta: number) {
         if (!this.frames.length) return;
         this.frameIndex = clamp(this.frameIndex + delta, 0, this.frames.length - 1);
-        this.frameSlider.value = `${this.frameIndex}`;
+        if (this.frameSlider) {
+            this.frameSlider.value = `${this.frameIndex}`;
+        }
         this.updatePreview();
     }
 
     updatePreview() {
+        if (!this.frameLabel || !this.frameSlider || !this.previewImage || !this.previewStatus) return;
         if (!this.frames.length) {
             this.frameLabel.textContent = 'no frames';
             this.previewStatus.textContent = 'load transforms to preview 2D labels';
@@ -2955,7 +3506,7 @@ class BBoxAnnotation {
     }
 
     preparedBoxes(boxes = this.boxes): PreparedBox[] {
-        return boxes.map((box) => ({
+        return boxes.map(box => ({
             box,
             half: [
                 Math.max(box.size[0], 0.001) * 0.5,
@@ -2964,6 +3515,13 @@ class BBoxAnnotation {
             ],
             rotation: rotationMatrix(box.euler[0], box.euler[1], box.euler[2])
         }));
+    }
+
+    preparedSegmentationBoxes(boxes = this.boxes) {
+        return {
+            include: this.preparedBoxes(boxes.filter(box => box.operation !== 'exclude')),
+            exclude: this.preparedBoxes(boxes.filter(box => box.operation === 'exclude'))
+        };
     }
 
     pointInPreparedBox(point: Vec3, prepared: PreparedBox) {
@@ -2990,6 +3548,10 @@ class BBoxAnnotation {
             }
         }
         return false;
+    }
+
+    pointInSegmentationBoxes(point: Vec3, include: PreparedBox[], exclude: PreparedBox[]) {
+        return this.pointInPreparedBoxes(point, include) && !this.pointInPreparedBoxes(point, exclude);
     }
 
     boxCenterMask(width: number, height: number, radius: number, box: Box) {
@@ -3089,7 +3651,7 @@ class BBoxAnnotation {
             };
         }
 
-        const prepared = this.preparedBoxes(boxes);
+        const { include, exclude } = this.preparedSegmentationBoxes(boxes);
         const centers = splat.entity.gsplat.instance.sorter.centers as Float32Array;
         const state = splat.splatData.getProp('state') as Uint8Array;
         const world = splat.worldTransform;
@@ -3124,7 +3686,7 @@ class BBoxAnnotation {
             const offset = i * 3;
             point.set(centers[offset], centers[offset + 1], centers[offset + 2]);
             world.transformPoint(point, point);
-            if (!this.pointInPreparedBoxes(point, prepared)) {
+            if (!this.pointInSegmentationBoxes(point, include, exclude)) {
                 continue;
             }
 
@@ -3235,6 +3797,177 @@ class BBoxAnnotation {
         this.scene.forceRender = true;
         this.updateHandles();
         this.segmentMessage(`capture center set from ${this.box.id}`);
+    }
+
+    losStepsPerSegment() {
+        const value = Math.round(Number(this.losStepsInput?.value ?? 8));
+        if (!Number.isFinite(value) || value < 1 || value > 1000) {
+            throw new Error('LOS steps per segment must be in [1, 1000]');
+        }
+        return value;
+    }
+
+    syncLosWaypointStatus() {
+        if (!this.losWaypointStatus) return;
+        let viewCount = 0;
+        try {
+            const steps = this.losStepsPerSegment();
+            viewCount = this.losWaypoints.length >= 2 ? (this.losWaypoints.length - 1) * steps + 1 : 0;
+        } catch (err) {
+            this.losWaypointStatus.textContent = `LOS path: ${err instanceof Error ? err.message : String(err)}`;
+            return;
+        }
+        this.losWaypointStatus.textContent = `LOS path: ${this.losWaypoints.length} waypoints · ${viewCount} output views`;
+    }
+
+    addLosWaypoint() {
+        const position = this.scene.camera.position.clone();
+        const previous = this.losWaypoints[this.losWaypoints.length - 1];
+        if (previous) {
+            const dx = position.x - previous.x;
+            const dy = position.y - previous.y;
+            const dz = position.z - previous.z;
+            if (Math.sqrt(dx * dx + dy * dy + dz * dz) <= Math.max(this.sceneExtent() * 1e-6, 1e-7)) {
+                this.segmentMessage('LOS waypoint: move the camera before adding another point');
+                return;
+            }
+        }
+        this.losWaypoints.push(position);
+        this.syncLosWaypointStatus();
+        this.scene.forceRender = true;
+        this.segmentMessage(`LOS waypoint ${this.losWaypoints.length} added at (${this.sceneToMeters(position.x).toFixed(2)}, ${this.sceneToMeters(position.y).toFixed(2)}, ${this.sceneToMeters(position.z).toFixed(2)})m`);
+    }
+
+    undoLosWaypoint() {
+        if (!this.losWaypoints.length) {
+            this.segmentMessage('LOS waypoint: no point to undo');
+            return;
+        }
+        this.losWaypoints.pop();
+        this.syncLosWaypointStatus();
+        this.scene.forceRender = true;
+        this.segmentMessage(`LOS waypoint removed; ${this.losWaypoints.length} remaining`);
+    }
+
+    clearLosWaypoints() {
+        this.losWaypoints = [];
+        this.syncLosWaypointStatus();
+        this.scene.forceRender = true;
+        this.segmentMessage('LOS path cleared');
+    }
+
+    losRunId() {
+        const now = new Date();
+        const two = (value: number) => String(value).padStart(2, '0');
+        const three = (value: number) => String(value).padStart(3, '0');
+        return `los_${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}_${two(now.getHours())}${two(now.getMinutes())}${two(now.getSeconds())}_${three(now.getMilliseconds())}`;
+    }
+
+    async runLosPathExport() {
+        if (this.spiralRunning) {
+            this.spiralRunning = false;
+            this.segmentMessage('LOS path: stopping after current view...');
+            return;
+        }
+        if (this.losWaypoints.length < 2) {
+            throw new Error('add at least two good camera waypoints');
+        }
+
+        this.readInputs();
+        if (!this.outputDirHandle && (window as any).showDirectoryPicker) {
+            await this.chooseOutputFolder();
+        }
+
+        const dirHandle = this.outputDirHandle;
+        const target = this.spiralCenter();
+        const targetMeters = [this.sceneToMeters(target.x), this.sceneToMeters(target.y), this.sceneToMeters(target.z)];
+        const waypoints = this.losWaypoints.map(point => point.clone());
+        const steps = this.losStepsPerSegment();
+        const totalViews = (waypoints.length - 1) * steps + 1;
+        const runId = this.losRunId();
+        const minTargetDistance = Math.max(this.sceneExtent() * 1e-6, 1e-7);
+
+        waypoints.forEach((point, index) => {
+            const dx = point.x - target.x;
+            const dy = point.y - target.y;
+            const dz = point.z - target.z;
+            if (Math.sqrt(dx * dx + dy * dy + dz * dz) <= minTargetDistance) {
+                throw new Error(`waypoint ${index + 1} is too close to the LOS target`);
+            }
+        });
+
+        const manifest: any = {
+            description: 'Piecewise-linear camera-position interpolation through user-approved viewpoints. Camera orientation is recomputed as fixed LOS to one target with zero roll.',
+            run_id: runId,
+            interpolation: 'piecewise_linear_position',
+            orientation: 'look_at_fixed_target_zero_roll',
+            units: 'meters',
+            metric_scale: {
+                meters_per_scene_unit: this.metersPerSceneUnit,
+                scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
+            },
+            target: targetMeters,
+            target_scene: [target.x, target.y, target.z],
+            steps_per_segment: steps,
+            expected_view_count: totalViews,
+            waypoints: waypoints.map((point, index) => ({
+                index,
+                position: [this.sceneToMeters(point.x), this.sceneToMeters(point.y), this.sceneToMeters(point.z)],
+                position_scene: [point.x, point.y, point.z]
+            })),
+            boxes: this.payload().boxes,
+            views: []
+        };
+
+        this.spiralRunning = true;
+        let viewIndex = 0;
+        try {
+            for (let segmentIndex = 0; segmentIndex < waypoints.length - 1; segmentIndex++) {
+                const start = waypoints[segmentIndex];
+                const end = waypoints[segmentIndex + 1];
+                for (let stepIndex = 0; stepIndex <= steps; stepIndex++) {
+                    if (segmentIndex > 0 && stepIndex === 0) continue;
+                    if (!this.spiralRunning) break;
+
+                    const t = stepIndex / steps;
+                    const position = new Vec3(
+                        start.x + (end.x - start.x) * t,
+                        start.y + (end.y - start.y) * t,
+                        start.z + (end.z - start.z) * t
+                    );
+                    this.scene.camera.setPose(position, target, 0);
+                    this.scene.forceRender = true;
+
+                    const prefix = `${runId}_${String(viewIndex).padStart(4, '0')}`;
+                    this.segmentMessage(`LOS path: ${viewIndex + 1}/${totalViews} · segment ${segmentIndex + 1} · t=${t.toFixed(3)}`);
+                    const result = await this.captureViewSet(prefix, dirHandle);
+                    manifest.views.push({
+                        index: viewIndex,
+                        prefix,
+                        segment_index: segmentIndex,
+                        step_index: stepIndex,
+                        interpolation_t: t,
+                        camera_position: [this.sceneToMeters(position.x), this.sceneToMeters(position.y), this.sceneToMeters(position.z)],
+                        camera_position_scene: [position.x, position.y, position.z],
+                        target: targetMeters,
+                        target_scene: [target.x, target.y, target.z],
+                        result
+                    });
+                    viewIndex++;
+
+                    await new Promise((resolve) => {
+                        setTimeout(resolve, 0);
+                    });
+                }
+                if (!this.spiralRunning) break;
+            }
+        } finally {
+            this.spiralRunning = false;
+            manifest.generated_view_count = viewIndex;
+            manifest.complete = viewIndex === totalViews;
+            await this.writeTextFile(`${runId}_manifest.json`, JSON.stringify(manifest, null, 2), dirHandle);
+            this.segmentMessage(`LOS path ${manifest.complete ? 'done' : 'stopped'}: ${formatCount(viewIndex)} views · ${runId}`);
+        }
     }
 
     writeSpiralInputsFromSceneValues(center: Vec3 | null, radii: number[] | null) {
@@ -3526,12 +4259,27 @@ class BBoxAnnotation {
         }
     }
 
-    currentViewPayload(width: number, height: number, mask: ViewMask | null = null, maskRadius = this.maskRadiusPx(), prefix = 'current') {
+    currentViewPayload(
+        width: number,
+        height: number,
+        mask: ViewMask | null = null,
+        maskRadius = this.maskRadiusPx(),
+        prefix = 'current',
+        files: CaptureFiles | null = null
+    ) {
         this.readInputs();
         const camera = this.scene.camera.camera;
         const cameraTransform = this.scene.camera.mainCamera.getWorldTransform();
+        const includeBoxCount = this.boxes.filter(box => box.operation !== 'exclude').length;
+        const excludeBoxCount = this.boxes.length - includeBoxCount;
+        const captureFiles: CaptureFiles = files ?? {
+            rgbFile: `${prefix}_rgb.png`,
+            overlayFile: `${prefix}_overlay.png`,
+            maskFile: `${prefix}_mask.png`,
+            annotationFile: `${prefix}_annotation.json`
+        };
         return {
-            description: 'Current SuperSplat renderer-view annotation. Coordinates are screen pixels in this captured view. Segmentation mask is one union of all bbox-derived selected splats.',
+            description: 'Current SuperSplat renderer-view annotation. Segmentation is the include bbox union minus the remove bbox union.',
             units: 'meters',
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
@@ -3540,9 +4288,10 @@ class BBoxAnnotation {
             image: {
                 width,
                 height,
-                rgb_file: `${prefix}_rgb.png`,
-                overlay_file: `${prefix}_overlay.png`,
-                mask_file: `${prefix}_mask.png`
+                rgb_file: captureFiles.rgbFile,
+                overlay_file: captureFiles.overlayFile,
+                mask_file: captureFiles.maskFile,
+                annotation_file: captureFiles.annotationFile
             },
             camera: {
                 world_matrix: Array.from(cameraTransform.data),
@@ -3554,13 +4303,15 @@ class BBoxAnnotation {
                 orthographic: this.scene.camera.ortho
             },
             segmentation: {
-                type: 'bbox_union_selected_gaussian_center_disk_mask',
-                mask_file: mask?.maskFile ?? `${prefix}_mask.png`,
+                type: 'bbox_include_union_minus_remove_union_selected_gaussian_center_disk_mask',
+                mask_file: mask?.maskFile ?? captureFiles.maskFile,
                 mask_radius_px: maskRadius,
                 mask_area_pixels: mask?.area ?? 0,
                 mask_bbox_xywh: mask?.bbox ?? null,
                 projected_selected_centers: mask?.projectedPoints ?? 0,
-                source_box_count: this.boxes.length
+                source_box_count: this.boxes.length,
+                include_box_count: includeBoxCount,
+                remove_box_count: excludeBoxCount
             },
             annotations: this.boxes.map((box, index) => {
                 const active = index === this.activeBoxIndex;
@@ -3569,9 +4320,11 @@ class BBoxAnnotation {
                 return {
                     id: box.id,
                     label: box.label,
+                    operation: box.operation,
                     active,
-                    type: 'bbox3d_union_source',
-                    contributes_to_mask_file: mask?.maskFile ?? `${prefix}_mask.png`,
+                    type: box.operation === 'exclude' ? 'bbox3d_remove_source' : 'bbox3d_include_source',
+                    mask_effect: box.operation === 'exclude' ? 'subtract' : 'add',
+                    contributes_to_mask_file: mask?.maskFile ?? captureFiles.maskFile,
                     projected_box_xywh: viewBox?.bbox ?? null,
                     projected_box_visible_corners: viewBox?.visibleCorners ?? 0,
                     box3d: {
@@ -3606,6 +4359,25 @@ class BBoxAnnotation {
         const savedSelectedClr = new Color(selectedClr.r, selectedClr.g, selectedClr.b, selectedClr.a);
         const captureSelectedClr = new Color(savedSelectedClr.r, savedSelectedClr.g, savedSelectedClr.b, 0);
         const { width, height } = this.currentCaptureSize();
+        const rgbName = `${prefix}_rgb.png`;
+        const overlayName = `${prefix}_overlay.png`;
+        const maskName = `${prefix}_mask.png`;
+        const annotationName = `${prefix}_annotation.json`;
+        let rgbDirHandle = dirHandle;
+        let maskDirHandle = dirHandle;
+        const files: CaptureFiles = {
+            rgbFile: rgbName,
+            overlayFile: overlayName,
+            maskFile: maskName,
+            annotationFile: annotationName
+        };
+
+        if (dirHandle?.getDirectoryHandle) {
+            rgbDirHandle = await dirHandle.getDirectoryHandle('RGB', { create: true });
+            maskDirHandle = await dirHandle.getDirectoryHandle('Mask', { create: true });
+            files.rgbFile = `RGB/${rgbName}`;
+            files.maskFile = `Mask/${maskName}`;
+        }
 
         this.segmentMessage(`view export: rendering ${width}x${height} RGB and mask...`);
         try {
@@ -3614,7 +4386,7 @@ class BBoxAnnotation {
             const radius = this.maskRadiusPx();
             const union = this.boxesCenterMask(width, height, radius);
             const mask: ViewMask = {
-                maskFile: `${prefix}_mask.png`,
+                maskFile: files.maskFile,
                 area: union.area,
                 bbox: union.bbox,
                 projectedPoints: union.projectedPoints,
@@ -3628,16 +4400,26 @@ class BBoxAnnotation {
                 rgbaToPngBlob(mask.pixels, width, height)
             ]);
 
-            await this.writeBlobFile(`${prefix}_rgb.png`, rgbBlob, dirHandle);
-            await this.writeBlobFile(`${prefix}_overlay.png`, overlayBlob, dirHandle);
-            await this.writeBlobFile(mask.maskFile, maskBlob, dirHandle);
-            await this.writeTextFile(`${prefix}_annotation.json`, JSON.stringify(this.currentViewPayload(width, height, mask, radius, prefix), null, 2), dirHandle);
+            await this.writeBlobFile(rgbName, rgbBlob, rgbDirHandle);
+            await this.writeBlobFile(overlayName, overlayBlob, dirHandle);
+            await this.writeBlobFile(maskName, maskBlob, maskDirHandle);
+            await this.writeTextFile(
+                annotationName,
+                JSON.stringify(this.currentViewPayload(width, height, mask, radius, prefix, files), null, 2),
+                dirHandle
+            );
 
             this.segmentMessage(`view export: union mask saved, ${formatCount(mask.projectedPoints)} centers from ${this.boxes.length} bboxes`);
             return {
                 prefix,
                 width,
                 height,
+                files: {
+                    rgbFile: files.rgbFile,
+                    overlayFile: files.overlayFile,
+                    maskFile: files.maskFile,
+                    annotationFile: files.annotationFile
+                },
                 mask: {
                     maskFile: mask.maskFile,
                     area: mask.area,
@@ -3672,6 +4454,7 @@ class BBoxAnnotation {
                 annotations: projected ? [{
                     box3d_id: this.box.id,
                     label: this.box.label,
+                    operation: this.box.operation,
                     bbox: projected.bbox,
                     visible_corners: projected.visibleCorners,
                     box3d: {

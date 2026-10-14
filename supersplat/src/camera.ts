@@ -40,6 +40,9 @@ import { ShaderQuad, SimpleRenderPass } from './utils/simple-render-pass';
 // work globals
 const forwardVec = new Vec3();
 const cameraPosition = new Vec3();
+const yawRotation = new Quat();
+const pitchRotation = new Quat();
+const cameraRotation = new Quat();
 const ray = new Ray();
 const vec = new Vec3();
 const vecb = new Vec3();
@@ -68,6 +71,16 @@ class Camera extends Element {
         result.set(-c1 * s2, s1, c1 * c2);
     }
 
+    calcForwardVec(result: Vec3, azim: number, elev: number) {
+        if (this.upAxis === 'z') {
+            const yaw = azim * math.DEG_TO_RAD;
+            const pitch = elev * math.DEG_TO_RAD;
+            result.set(Math.cos(pitch) * Math.sin(yaw), -Math.cos(pitch) * Math.cos(yaw), -Math.sin(pitch));
+        } else {
+            Camera.calcForwardVec(result, azim, elev);
+        }
+    }
+
     controller: PointerController;
     focalPointTween = new TweenValue({ x: 0, y: 0.5, z: 0 });
     azimElevTween = new TweenValue({ azim: 30, elev: -15 });
@@ -81,6 +94,14 @@ class Camera extends Element {
     flySpeed = 1;
 
     controlMode: 'orbit' | 'fly' = 'orbit';
+    // The DJI Nerfstudio export is Z-up; ordinary SuperSplat scenes remain Y-up.
+    // An explicit URL parameter overrides detection for either convention.
+    upAxis: 'y' | 'z' = (() => {
+        const params = new URL(window.location.href).searchParams;
+        const requested = params.get('up');
+        if (requested === 'y' || requested === 'z') return requested;
+        return [...params.getAll('load'), ...params.getAll('filename')].some(value => value.includes('dji_0967_splat.ply')) ? 'z' : 'y';
+    })();
 
     // during fly-mode look, stores the camera position that must stay fixed
     // while the azim/elev tween smoothly converges
@@ -104,6 +125,9 @@ class Camera extends Element {
 
     // overridden target size
     targetSizeOverride: { width: number, height: number } = null;
+    // Fixed sensor frustum for the annotation preview; independent of viewport size.
+    sensorAspect: number | null = null;
+    analysisPass = false;
 
     // when set, overrides the tween-driven pose, fov and clipping planes each
     // update (used by 360 capture to render arbitrary face orientations that
@@ -230,13 +254,13 @@ class Camera extends Element {
         const sensitivity = this.scene.config.controls.orbitSensitivity;
         const d = this.distance * this.sceneRadius / this.fovFactor;
 
-        Camera.calcForwardVec(forwardVec, this.azim, this.elevation);
+        this.calcForwardVec(forwardVec, this.azim, this.elevation);
         const cameraPos = this.focalPoint.add(forwardVec.clone().mulScalar(d));
 
         const azim = this.azim - dx * sensitivity;
         const elev = this.elevation - dy * sensitivity;
 
-        Camera.calcForwardVec(forwardVec, azim, elev);
+        this.calcForwardVec(forwardVec, azim, elev);
         const focalPoint = cameraPos.clone().sub(forwardVec.clone().mulScalar(d));
 
         this.setAzimElev(azim, elev);
@@ -278,8 +302,10 @@ class Camera extends Element {
     setPose(position: Vec3, target: Vec3, dampingFactorFactor: number = 1) {
         vec.sub2(target, position);
         const l = vec.length();
-        const azim = Math.atan2(-vec.x / l, -vec.z / l) * math.RAD_TO_DEG;
-        const elev = Math.asin(vec.y / l) * math.RAD_TO_DEG;
+        const azim = this.upAxis === 'z' ?
+            Math.atan2(-vec.x / l, vec.y / l) * math.RAD_TO_DEG :
+            Math.atan2(-vec.x / l, -vec.z / l) * math.RAD_TO_DEG;
+        const elev = Math.asin((this.upAxis === 'z' ? vec.z : vec.y) / l) * math.RAD_TO_DEG;
         this.setFocalPoint(target, dampingFactorFactor);
         this.setAzimElev(azim, elev, dampingFactorFactor);
         this.setDistance(l / this.sceneRadius * this.fovFactor, dampingFactorFactor);
@@ -367,6 +393,9 @@ class Camera extends Element {
         // initial camera position and orientation
         this.setAzimElev(controls.initialAzim, controls.initialElev, 0);
         this.setDistance(controls.initialZoom, 0);
+        if (this.upAxis === 'z') {
+            this.setFocalPoint(Vec3.ZERO, 0);
+        }
 
         // picker
         this.picker = new Picker(scene);
@@ -475,6 +504,15 @@ class Camera extends Element {
     // handle the viewer canvas resizing
     rebuildRenderTargets() {
         const { width, height } = this.targetSize;
+
+        // Legacy offscreen/video rendering can use its own aspect and lens.
+        const sensorAspect = (!this.targetSizeOverride || this.analysisPass) ? this.sensorAspect : null;
+        this.camera.horizontalFov = sensorAspect !== null || width > height;
+        this.camera.aspectRatio = sensorAspect ?? width / height;
+        if (sensorAspect !== null) {
+            this.camera.fov = 118;
+            this.ortho = false;
+        }
         const { mainTarget, scene } = this;
 
         // early out if size is unchanged
@@ -576,8 +614,6 @@ class Camera extends Element {
             splatTarget.resize(width, height);
         }
 
-        this.camera.horizontalFov = width > height;
-        this.camera.aspectRatio = width / height;
         scene.events.fire('camera.resize', { width, height });
     }
 
@@ -593,7 +629,7 @@ class Camera extends Element {
         const azimElev = this.azimElevTween.value;
         const distance = this.distanceTween.value;
 
-        Camera.calcForwardVec(forwardVec, azimElev.azim, azimElev.elev);
+        this.calcForwardVec(forwardVec, azimElev.azim, azimElev.elev);
 
         if (this.lookCameraPos) {
             cameraPosition.copy(this.lookCameraPos);
@@ -616,7 +652,14 @@ class Camera extends Element {
             this.far = far;
         } else {
             this.mainCamera.setLocalPosition(cameraPosition);
-            this.mainCamera.setLocalEulerAngles(azimElev.elev, azimElev.azim, 0);
+            if (this.upAxis === 'z') {
+                yawRotation.setFromAxisAngle(Vec3.BACK, azimElev.azim);
+                pitchRotation.setFromAxisAngle(Vec3.RIGHT, 90 + azimElev.elev);
+                cameraRotation.mul2(yawRotation, pitchRotation);
+                this.mainCamera.setLocalRotation(cameraRotation);
+            } else {
+                this.mainCamera.setLocalEulerAngles(azimElev.elev, azimElev.azim, 0);
+            }
 
             this.fitClippingPlanes(this.mainCamera.getLocalPosition(), this.mainCamera.forward);
 

@@ -250,12 +250,11 @@ const registerEditorEvents = (events: Events, editHistory: EditHistory, scene: S
 
     events.on('camera.reset', () => {
         const { initialAzim, initialElev, initialZoom } = scene.config.controls;
-        const x = Math.sin(initialAzim * Math.PI / 180) * Math.cos(initialElev * Math.PI / 180);
-        const y = -Math.sin(initialElev * Math.PI / 180);
-        const z = Math.cos(initialAzim * Math.PI / 180) * Math.cos(initialElev * Math.PI / 180);
+        const direction = new Vec3();
+        scene.camera.calcForwardVec(direction, initialAzim, initialElev);
         const zoom = initialZoom;
 
-        scene.camera.setPose(new Vec3(x * zoom, y * zoom, z * zoom), new Vec3(0, 0, 0));
+        scene.camera.setPose(direction.mulScalar(zoom), new Vec3(0, 0, 0));
     });
 
     // handle camera align events
