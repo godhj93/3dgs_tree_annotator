@@ -10,6 +10,7 @@ uint8_t rgb[FULL * 4], mask[FULL], labels[FULL];
 float depth[FULL], rotation[9], branchData[MAX_BRANCHES * FIELDS];
 int16_t junctionData[MAX_JUNCTIONS * 2];
 uint8_t foreground[N], skeleton[N], removeMark[N], smallLabel[N];
+uint8_t rawSkeleton[N];
 float smallDepth[N];
 uint32_t queue[N];
 int branchCount, junctionCount;
@@ -34,6 +35,16 @@ inline int degree(int x, int y) {
     int transitions=0; for (int k=0;k<8;k++) transitions+=!p[k]&&p[(k+1)&7];
     return transitions;
 }
+// The inspection skeleton is derived from the segmentation mask alone. Its
+// boundary neighbours are treated as background so edge pixels are retained.
+inline void rawNeighbours(int x, int y, uint8_t p[8]) {
+    const int dx[8]={0,1,1,1,0,-1,-1,-1};
+    const int dy[8]={-1,-1,0,1,1,1,0,-1};
+    for(int k=0;k<8;k++) {
+        int nx=x+dx[k],ny=y+dy[k];
+        p[k]=(nx>=0&&nx<W&&ny>=0&&ny<H)?rawSkeleton[index(nx,ny)]:0;
+    }
+}
 inline void point(float x, float y, float d, float fx, float fy, float cx, float cy, float out[3]) {
     const float nearValue = clampF((d-depthLow)/(depthHigh-depthLow+1e-6f),0,1);
     const float z = 1.0f/(0.2f+0.8f*nearValue);
@@ -48,11 +59,48 @@ uint8_t* bd_mask() { return mask; }
 float* bd_depth() { return depth; }
 float* bd_rotation() { return rotation; }
 uint8_t* bd_labels() { return labels; }
+uint8_t* bd_raw_skeleton() { return rawSkeleton; }
 float* bd_branches() { return branchData; }
 int16_t* bd_junctions() { return junctionData; }
 int bd_branch_count() { return branchCount; }
 int bd_junction_count() { return junctionCount; }
 int bd_fields() { return FIELDS; }
+
+// Unfiltered Zhang-Suen thinning of the 2x2-downsampled visible segmentation.
+// This deliberately does not inspect depth, RGB, component size, or branch IDs.
+int bd_run_raw_skeleton() {
+    int xmin=W,xmax=-1,ymin=H,ymax=-1;
+    for(int y=0;y<H;y++) for(int x=0;x<W;x++) {
+        const int i=index(x,y),j=(y*2)*640+x*2;
+        rawSkeleton[i]=(mask[j]||mask[j+1]||mask[j+640]||mask[j+641])?1:0;
+        if(rawSkeleton[i]) { xmin=minI(xmin,x);xmax=maxI(xmax,x);ymin=minI(ymin,y);ymax=maxI(ymax,y); }
+    }
+    if(xmax<0) return 0;
+    // A 320x320 shape can shrink by at most 160 layers; stop at convergence.
+    for(int iter=0;iter<160;iter++) {
+        int removed=0;
+        for(int pass=0;pass<2;pass++) {
+            for(int y=ymin;y<=ymax;y++) for(int x=xmin;x<=xmax;x++) {
+                const int i=index(x,y);removeMark[i]=0;
+                if(!rawSkeleton[i])continue;
+                uint8_t p[8];rawNeighbours(x,y,p);int n=0,t=0;
+                for(int k=0;k<8;k++){n+=p[k];t+=!p[k]&&p[(k+1)&7];}
+                if(n<2||n>6||t!=1)continue;
+                if(!pass) {if((p[0]&&p[2]&&p[4])||(p[2]&&p[4]&&p[6]))continue;}
+                else {if((p[0]&&p[2]&&p[6])||(p[0]&&p[4]&&p[6]))continue;}
+                removeMark[i]=1;
+            }
+            for(int y=ymin;y<=ymax;y++) for(int x=xmin;x<=xmax;x++) {
+                const int i=index(x,y);
+                if(removeMark[i]){rawSkeleton[i]=0;removed++;}
+            }
+        }
+        if(!removed)break;
+    }
+    int count=0;
+    for(int i=0;i<N;i++)count+=rawSkeleton[i]!=0;
+    return count;
+}
 
 // Fields: id, score, length_px, area_px, width_px, straightness,
 // inclination, depth_consistency, center_x/y, end0_x/y, end1_x/y,

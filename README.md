@@ -84,8 +84,57 @@ explicitly select either convention.
   mask. No boxes produces an empty mask. Raw RGB excludes edit handles/highlights.
 - Depth is the raw DA2 relative output, not meters. The color preview uses
   per-frame 2nd/98th percentiles (blue far, red near). It does not change raw values.
-- The fourth tile shows CPU branch candidates as an instance-ID color map with
-  ranked landing candidates over the current RGB frame. A C++17 core uses
+- The fourth tile defaults to **Raw skeleton**: magenta skeleton pixels over
+  the synchronized RGB view. It thins the visible segmentation at 320×320
+  with Zhang–Suen, then displays only pixels inside the 640×640 visible mask.
+  It retains isolated components and does not use depth, size, direction,
+  trunk, or landing-rank filters. The raw skeleton appears as soon as RGB and
+  segmentation are ready, even while DA2 is still computing. Use **View →
+  Landing candidates** to inspect the existing filtered result; its search
+  controls appear in that mode.
+- The fifth tile defaults to **colored links**: each raw skeleton segment between
+  junctions gets a distinct color, expanded only within the visible segmentation
+  mask. Both images zoom to the raw skeleton for inspection. The left image keeps
+  every 2D link separate. The right preserves a distinct object ID for every
+  junction arm, regardless of whether DA2 estimates similar or different depths.
+  DA2 can split a continuous 2D link further where its relative depth jumps;
+  loops returning to a junction are also separated, and the caption shows the
+  resulting object count and added cuts. Check **Show
+  junctions** to switch both images to the earlier junction display: yellow
+  marks every 2D topological junction; teal means similar arm depths, orange
+  means a depth gap, and gray means insufficient samples. A gap is marked when
+  it reaches 15% of the frame's robust relative-depth range and exceeds local
+  variation. This depth-guided grouping is a heuristic, not proof of physical
+  connectivity; DA2 does not provide metric depth. Junction arms are never
+  rejoined. The 2D side appears before DA2 finishes.
+- The sixth tile fits a 3D PCA axis to every DA2-separated segmentation object
+  using its visible mask pixels, camera intrinsics/rotation, and DA2 relative
+  depth. White lines mark reliable principal axes on the left; the right colors
+  the merged objects. Adjust **Maximum relative axis angle** from 0–90° in
+  either the normal or maximized BBox Manager. Only neighboring objects with a
+  local DA2 gap ≤15% of the frame's robust depth range and reliable axes can
+  merge; all axes in a merged group must satisfy the chosen sign-independent
+  angle. Changing the angle recomputes the grouping from the current frame
+  without rerunning DA2. These are dimensionless pseudo-3D axes, not metric
+  cylinder fits.
+- The seventh tile first compares **each unmerged DA2 segment's PCA axis** with
+  gravity and drops segments that fail. It then merges only survivors using the
+  sixth tile's relative-axis-angle setting, pools their PCA moments, and checks
+  the merged axes against gravity again. The left image shows the survivors
+  after merging; the right highlights those still passing. The sixth tile stays
+  unfiltered for comparison. **Maximum deviation from 90°** (default 20°)
+  applies at both stages and keeps reliable axes whose unsigned angle to the
+  scene's world-up/gravity axis lies in 70–90° by default. A value of 0°
+  requires an exactly horizontal axis; 90° admits every reliable axis.
+  **Minimum skeleton
+  length** (default 12 px) measures each merged object's raw centerline in
+  640×640 image pixels. **Exclude trunks** is off by default; when checked it
+  removes objects whose centerline substantially overlaps branches marked as
+  trunks by the existing detector. Changing the PCA merge angle or any seventh-
+  tile filter updates the current frame without rerunning DA2. Length is not
+  metric, and the angles use relative-depth pseudo-3D.
+- The landing-candidate mode shows branch instances and ranked landing
+  candidates over the current RGB frame. A C++17 core uses
   RGB, the visible annotation mask, DA2 relative depth, camera intrinsics, and
   camera rotation. It thins the 320×320 mask, splits centerlines at junctions,
   assigns visible pixels to branches, and ranks slender, long, relatively level

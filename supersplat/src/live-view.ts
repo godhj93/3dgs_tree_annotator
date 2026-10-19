@@ -22,13 +22,62 @@ type LiveSnapshot = {
     pose: any;
     depth: Float32Array | null;
     depthInfo?: any;
+    rawSkeleton?: Uint8Array;
+    rawSkeletonCount?: number;
+    rawJunctions?: JunctionMarker[];
+    rawOverlay?: HTMLCanvasElement;
+    linkLabels?: Uint32Array;
+    linkCount?: number;
+    linkOverlay?: HTMLCanvasElement;
+    depthLinkOverlay?: HTMLCanvasElement;
+    pcaMergedOverlay?: HTMLCanvasElement;
+    pcaMergedLabels?: Uint32Array;
+    pcaMergedCount?: number;
+    pcaMergedAngle?: number;
+    pcaMergedObjects?: GravityObject[];
+    gravityMergedLabels?: Uint32Array;
+    gravityMergedOverlay?: HTMLCanvasElement;
+    gravityMergedObjects?: GravityObject[];
+    gravityMergedKey?: string;
+    gravityEligibleCount?: number;
+    gravityFilteredLabels?: Uint32Array;
+    gravityFilteredOverlay?: HTMLCanvasElement;
+    gravityFilterKey?: string;
+    comparisonCrop?: { x: number; y: number; size: number };
     detection?: BranchDetection;
 };
+
+type JunctionMarker = { x: number; y: number; armCount: number };
+type DepthJunctionMarker = JunctionMarker & {
+    sampledArms: number;
+    status: 'similar-depth' | 'depth-separated' | 'uncertain';
+    relativeGap: number;
+    relativeNoise: number;
+    armDepths: number[];
+};
+
+type PcaObject = { id: number; pixels: number; center: number[]; axis: number[];
+    linearity: number; reliable: boolean; centerPx: number[]; endpointsPx: number[][] | null;
+    centerlineLengthPx: number; trunkCenterlineLengthPx: number; detectorCenterlineLengthPx: number;
+    moments: { sum: number[]; outer: number[] } };
+type PcaAdjacency = { a: number; b: number; contacts: number; angleDeg: number; depthGap: number; eligible: boolean };
+type GravityObject = { id: number; pixels: number; axis: number[]; linearity: number;
+    reliable: boolean; angleToGravityDeg: number | null; centerlineLengthPx: number;
+    trunkCenterlineLengthPx: number; detectorCenterlineLengthPx: number; isTrunk: boolean };
 
 type BranchDetection = {
     frameId: string;
     branches: any[];
     junctions: number[];
+    rawJunctions: JunctionMarker[];
+    junctionComparison: DepthJunctionMarker[];
+    depthLinkLabels: Uint32Array;
+    depthLinkCount: number;
+    depthLinkCuts: number;
+    depthJunctionCuts: number;
+    depthJunctionArmIds: number[][];
+    pcaObjects: PcaObject[];
+    pcaAdjacency: PcaAdjacency[];
     instanceMask: Uint8Array;
     cpu_ms: number;
     geometry_units: string;
@@ -100,6 +149,27 @@ const instanceCanvas = (ids: Uint8Array, color: boolean) => {
     return pixelCanvas(pixels, 640, 640);
 };
 
+const principalAxisFromMoments = (pixels: number, sum: number[], outer: number[]) => {
+    if (!pixels) return { axis: [1, 0, 0], linearity: 0, reliable: false };
+    const center = sum.map(value => value / pixels);
+    const covariance = outer.map((value, i) => value / pixels -
+        center[Math.floor(i / 3)] * center[i % 3]);
+    const trace = covariance[0] + covariance[4] + covariance[8];
+    let axis = [1, 0.37, 0.11];
+    for (let iteration = 0; iteration < 16; iteration++) {
+        const next = [0, 1, 2].map(row => covariance[row * 3] * axis[0] +
+            covariance[row * 3 + 1] * axis[1] + covariance[row * 3 + 2] * axis[2]);
+        const norm = Math.hypot(...next);
+        if (norm < 1e-12) break;
+        axis = next.map(value => value / norm);
+    }
+    const eigenvalue = axis.reduce((sumValue, value, row) => sumValue + value *
+        (covariance[row * 3] * axis[0] + covariance[row * 3 + 1] * axis[1] +
+            covariance[row * 3 + 2] * axis[2]), 0);
+    const linearity = trace > 1e-12 ? Math.max(0, Math.min(1, (3 * eigenvalue / trace - 1) / 2)) : 0;
+    return { axis, linearity, reliable: pixels >= 6 && linearity >= 0.2 };
+};
+
 class LiveView {
     enabled = true;
     capturing = false;
@@ -119,6 +189,29 @@ class LiveView {
     depthPreview: HTMLCanvasElement;
     branchCanvas: HTMLCanvasElement;
     branchList: HTMLDivElement;
+    junctionNoDepthCanvas: HTMLCanvasElement;
+    junctionDepthCanvas: HTMLCanvasElement;
+    junctionNoDepthLabel: HTMLDivElement;
+    junctionDepthLabel: HTMLDivElement;
+    junctionSummary: HTMLDivElement;
+    junctionCheckbox: HTMLInputElement;
+    pcaInputCanvas: HTMLCanvasElement;
+    pcaMergedCanvas: HTMLCanvasElement;
+    pcaInputLabel: HTMLDivElement;
+    pcaMergedLabel: HTMLDivElement;
+    pcaSummary: HTMLDivElement;
+    pcaAngleSlider: HTMLInputElement;
+    pcaAngleNumber: HTMLInputElement;
+    gravityInputCanvas: HTMLCanvasElement;
+    gravityFilteredCanvas: HTMLCanvasElement;
+    gravityInputLabel: HTMLDivElement;
+    gravityFilteredLabel: HTMLDivElement;
+    gravitySummary: HTMLDivElement;
+    gravityAngleSlider: HTMLInputElement;
+    gravityAngleNumber: HTMLInputElement;
+    gravityLengthSlider: HTMLInputElement;
+    gravityLengthNumber: HTMLInputElement;
+    gravityTrunkCheckbox: HTMLInputElement;
     detectorWorker: Worker | null = null;
     excludeTrunk = false;
     horizontalAngle = 25;
@@ -127,6 +220,12 @@ class LiveView {
     minDirectionConfidence = 0.5;
     landingTopK = 3;
     showMainLanding = true;
+    showJunctions = false;
+    pcaMaxAngle = 20;
+    gravityTolerance = 20;
+    minGravityLength = 12;
+    excludeGravityTrunks = false;
+    viewMode: 'raw' | 'candidates' = 'raw';
     showYellowSegmentation = true;
     mainOverlay: HTMLCanvasElement;
     saveButton: HTMLButtonElement;
@@ -191,7 +290,9 @@ class LiveView {
             .live-controls { display:flex; align-items:center; flex-wrap:wrap; gap:7px; margin-bottom:7px; }
             .live-controls label { display:flex; align-items:center; gap:3px; }
             .live-controls input { width:auto; }
+            .live-controls select { border:1px solid #52677d; border-radius:3px; background:#101d2b; color:#e6f4ff; padding:3px 5px; }
             .live-controls input[type="range"] { width:104px; accent-color:#55dce9; }
+            .live-controls [hidden], .landing-search[hidden] { display:none !important; }
             .landing-topk-control input { width:64px; box-sizing:border-box; padding:3px 5px; border:1px solid #52677d; border-radius:3px; background:#101d2b; color:#e6f4ff; }
             .landing-search { margin:4px 0 10px; padding:6px 8px; border:1px solid #344758; border-radius:5px; background:#0d1822; }
             .landing-search summary { cursor:pointer; color:#81d4fa; font-size:12px; font-weight:600; }
@@ -210,6 +311,18 @@ class LiveView {
             .live-branch-list { font-size:10px; line-height:1.35; padding:5px 6px; color:#cddce8; max-height:125px; overflow:auto; }
             .bbox-manager.maximized .live-branch-list { max-height:220px; }
             .live-branch-list div { margin-bottom:3px; }
+            .live-junction-tile { grid-column:1 / -1; }
+            .live-junction-tile .live-tile-title { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+            .live-junction-toggle { display:flex; align-items:center; gap:4px; color:#e2eff8; white-space:nowrap; cursor:pointer; }
+            .live-junction-toggle input { margin:0; accent-color:#55dce9; }
+            .live-junction-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px; padding:6px; }
+            .live-junction-view { min-width:0; }
+            .live-junction-view canvas { display:block; width:100%; height:auto; aspect-ratio:1; }
+            .live-junction-label { min-height:27px; padding:4px 1px; color:#cddce8; font-size:10px; }
+            .live-junction-summary { padding:1px 7px 7px; color:#a9bfd0; font-size:10px; line-height:1.35; }
+            .live-pca-controls { display:flex; align-items:center; gap:7px; flex-wrap:wrap; padding:4px 7px; color:#d9eaf4; font-size:11px; }
+            .live-pca-controls input[type="range"] { flex:1 1 125px; min-width:100px; accent-color:#55dce9; }
+            .live-pca-controls input[type="number"] { width:58px; padding:3px; box-sizing:border-box; border:1px solid #52677d; border-radius:3px; background:#101d2b; color:#e6f4ff; }
             .live-status { font-size:11px; color:#adc3d5; margin-top:7px; min-height:28px; overflow-wrap:anywhere; }
             .live-view[data-stale="true"] .live-grid { opacity:.55; }
             .live-view[data-state="error"] .live-status { color:#ffb59e; }
@@ -264,6 +377,15 @@ class LiveView {
         });
         yellowLabel.append(yellowInput, 'Yellow segmentation');
         controls.append(yellowLabel);
+        const viewLabel = document.createElement('label');
+        const viewSelect = document.createElement('select');
+        viewSelect.setAttribute('aria-label', 'Branch visualization');
+        for (const [value, title] of [['raw', 'Raw skeleton'], ['candidates', 'Landing candidates']]) {
+            const option = document.createElement('option'); option.value = value; option.textContent = title;
+            viewSelect.append(option);
+        }
+        viewLabel.append('View', viewSelect);
+        controls.append(viewLabel);
         const topKLabel = document.createElement('label');
         topKLabel.className = 'landing-topk-control';
         const topKInput = document.createElement('input');
@@ -349,6 +471,17 @@ class LiveView {
         });
         searchFooter.append(trunkLabel, reset);
         search.append(searchSummary, searchGrid, searchFooter);
+        topKLabel.hidden = true;
+        mainLabel.hidden = true;
+        search.hidden = true;
+        viewSelect.addEventListener('change', () => {
+            this.viewMode = viewSelect.value === 'candidates' ? 'candidates' : 'raw';
+            const raw = this.viewMode === 'raw';
+            topKLabel.hidden = raw;
+            mainLabel.hidden = raw;
+            search.hidden = raw;
+            if (this.last) this.drawBranches(this.last);
+        });
         const grid = document.createElement('div');
         grid.className = 'live-grid';
         const tile = (title: string) => {
@@ -366,11 +499,167 @@ class LiveView {
         this.rgbCanvas = tile('RGB') as HTMLCanvasElement;
         this.maskCanvas = tile('Segmentation · visible branches') as HTMLCanvasElement;
         this.depthPreview = tile('DA2 relative · blue far / red near') as HTMLCanvasElement;
-        this.branchCanvas = tile('Landing candidates · top K') as HTMLCanvasElement;
+        this.branchCanvas = tile('Raw skeleton · RGB overlay') as HTMLCanvasElement;
         this.branchList = document.createElement('div');
         this.branchList.className = 'live-branch-list';
-        this.branchList.textContent = 'Waiting for synchronized depth…';
+        this.branchList.textContent = 'Waiting for visible segmentation…';
         this.branchCanvas.parentElement.append(this.branchList);
+        const junctionTile = document.createElement('div');
+        junctionTile.className = 'live-tile live-junction-tile';
+        const junctionTitle = document.createElement('div');
+        junctionTitle.className = 'live-tile-title';
+        const junctionHeading = document.createElement('span');
+        junctionHeading.textContent = 'Links / junctions · 2D vs DA2';
+        const junctionToggle = document.createElement('label');
+        junctionToggle.className = 'live-junction-toggle';
+        this.junctionCheckbox = document.createElement('input');
+        this.junctionCheckbox.type = 'checkbox';
+        this.junctionCheckbox.setAttribute('aria-label', 'Show junctions');
+        this.junctionCheckbox.addEventListener('change', () => {
+            this.showJunctions = this.junctionCheckbox.checked;
+            if (this.last) this.drawJunctionComparison(this.last);
+        });
+        junctionToggle.append(this.junctionCheckbox, 'Show junctions');
+        junctionTitle.append(junctionHeading, junctionToggle);
+        const junctionGrid = document.createElement('div');
+        junctionGrid.className = 'live-junction-grid';
+        const junctionView = (label: string) => {
+            const view = document.createElement('div'); view.className = 'live-junction-view';
+            const canvas = document.createElement('canvas'); canvas.width = canvas.height = 640;
+            const caption = document.createElement('div'); caption.className = 'live-junction-label';
+            caption.textContent = label;
+            view.append(canvas, caption); junctionGrid.append(view);
+            return { canvas, caption };
+        };
+        const plain = junctionView('2D only · waiting for skeleton');
+        const guided = junctionView('With DA2 · waiting for relative depth');
+        this.junctionNoDepthCanvas = plain.canvas;
+        this.junctionDepthCanvas = guided.canvas;
+        this.junctionNoDepthLabel = plain.caption;
+        this.junctionDepthLabel = guided.caption;
+        this.junctionSummary = document.createElement('div');
+        this.junctionSummary.className = 'live-junction-summary';
+        this.junctionSummary.textContent = 'Each visible link has its own color. Check Show junctions to mark branching points.';
+        junctionTile.append(junctionTitle, junctionGrid, this.junctionSummary);
+        grid.append(junctionTile);
+        const pcaTile = document.createElement('div');
+        pcaTile.className = 'live-tile live-junction-tile live-pca-tile';
+        const pcaTitle = document.createElement('div');
+        pcaTitle.className = 'live-tile-title';
+        pcaTitle.textContent = 'PCA axis merging · DA2 segments';
+        const pcaControls = document.createElement('div');
+        pcaControls.className = 'live-pca-controls';
+        const pcaAngleLabel = document.createElement('label');
+        pcaAngleLabel.textContent = 'Maximum relative axis angle';
+        this.pcaAngleSlider = document.createElement('input');
+        this.pcaAngleSlider.type = 'range'; this.pcaAngleSlider.min = '0'; this.pcaAngleSlider.max = '90';
+        this.pcaAngleSlider.step = '1'; this.pcaAngleSlider.value = String(this.pcaMaxAngle);
+        this.pcaAngleSlider.setAttribute('aria-label', 'Maximum PCA axis angle');
+        this.pcaAngleNumber = document.createElement('input');
+        this.pcaAngleNumber.type = 'number'; this.pcaAngleNumber.min = '0'; this.pcaAngleNumber.max = '90';
+        this.pcaAngleNumber.step = '1'; this.pcaAngleNumber.value = String(this.pcaMaxAngle);
+        this.pcaAngleNumber.setAttribute('aria-label', 'Maximum PCA axis angle degrees');
+        const updateAngle = (value: number) => {
+            if (!Number.isFinite(value)) return;
+            this.pcaMaxAngle = Math.max(0, Math.min(90, Math.round(value)));
+            this.pcaAngleSlider.value = this.pcaAngleNumber.value = String(this.pcaMaxAngle);
+            if (this.last) this.drawPcaPanel(this.last);
+        };
+        this.pcaAngleSlider.addEventListener('input', () => updateAngle(Number(this.pcaAngleSlider.value)));
+        this.pcaAngleNumber.addEventListener('change', () => updateAngle(Number(this.pcaAngleNumber.value)));
+        pcaControls.append(pcaAngleLabel, this.pcaAngleSlider, this.pcaAngleNumber, document.createTextNode('°'));
+        const pcaGrid = document.createElement('div'); pcaGrid.className = 'live-junction-grid';
+        const pcaView = (label: string) => {
+            const view = document.createElement('div'); view.className = 'live-junction-view';
+            const canvas = document.createElement('canvas'); canvas.width = canvas.height = 640;
+            const caption = document.createElement('div'); caption.className = 'live-junction-label';
+            caption.textContent = label; view.append(canvas, caption); pcaGrid.append(view);
+            return { canvas, caption };
+        };
+        const pcaInput = pcaView('DA2 segments · waiting for depth');
+        const pcaMerged = pcaView('PCA merged · waiting for depth');
+        this.pcaInputCanvas = pcaInput.canvas; this.pcaInputLabel = pcaInput.caption;
+        this.pcaMergedCanvas = pcaMerged.canvas; this.pcaMergedLabel = pcaMerged.caption;
+        this.pcaSummary = document.createElement('div'); this.pcaSummary.className = 'live-junction-summary';
+        this.pcaSummary.textContent = 'PCA will fit each DA2 segment after relative depth arrives.';
+        pcaTile.append(pcaTitle, pcaControls, pcaGrid, this.pcaSummary);
+        grid.append(pcaTile);
+        const gravityTile = document.createElement('div');
+        gravityTile.className = 'live-tile live-junction-tile live-gravity-tile';
+        const gravityTitle = document.createElement('div');
+        gravityTitle.className = 'live-tile-title';
+        gravityTitle.textContent = 'Gravity angle filter · component → merged axis';
+        const gravityControls = document.createElement('div');
+        gravityControls.className = 'live-pca-controls';
+        const gravityAngleLabel = document.createElement('label');
+        gravityAngleLabel.textContent = 'Maximum deviation from 90°';
+        this.gravityAngleSlider = document.createElement('input');
+        this.gravityAngleSlider.type = 'range'; this.gravityAngleSlider.min = '0'; this.gravityAngleSlider.max = '90';
+        this.gravityAngleSlider.step = '1'; this.gravityAngleSlider.value = String(this.gravityTolerance);
+        this.gravityAngleSlider.setAttribute('aria-label', 'Maximum gravity angle deviation');
+        this.gravityAngleNumber = document.createElement('input');
+        this.gravityAngleNumber.type = 'number'; this.gravityAngleNumber.min = '0'; this.gravityAngleNumber.max = '90';
+        this.gravityAngleNumber.step = '1'; this.gravityAngleNumber.value = String(this.gravityTolerance);
+        this.gravityAngleNumber.setAttribute('aria-label', 'Maximum gravity angle deviation degrees');
+        const updateGravityAngle = (value: number) => {
+            if (!Number.isFinite(value)) return;
+            this.gravityTolerance = Math.max(0, Math.min(90, Math.round(value)));
+            this.gravityAngleSlider.value = this.gravityAngleNumber.value = String(this.gravityTolerance);
+            if (this.last) this.drawGravityPanel(this.last);
+        };
+        this.gravityAngleSlider.addEventListener('input', () => updateGravityAngle(Number(this.gravityAngleSlider.value)));
+        this.gravityAngleNumber.addEventListener('change', () => updateGravityAngle(Number(this.gravityAngleNumber.value)));
+        gravityControls.append(gravityAngleLabel, this.gravityAngleSlider, this.gravityAngleNumber,
+            document.createTextNode('°'));
+        const gravityLengthControls = document.createElement('div');
+        gravityLengthControls.className = 'live-pca-controls';
+        const gravityLengthLabel = document.createElement('label');
+        gravityLengthLabel.textContent = 'Minimum skeleton length';
+        this.gravityLengthSlider = document.createElement('input');
+        this.gravityLengthSlider.type = 'range'; this.gravityLengthSlider.min = '0'; this.gravityLengthSlider.max = '200';
+        this.gravityLengthSlider.step = '1'; this.gravityLengthSlider.value = String(this.minGravityLength);
+        this.gravityLengthSlider.setAttribute('aria-label', 'Minimum skeleton length');
+        this.gravityLengthNumber = document.createElement('input');
+        this.gravityLengthNumber.type = 'number'; this.gravityLengthNumber.min = '0'; this.gravityLengthNumber.max = '200';
+        this.gravityLengthNumber.step = '1'; this.gravityLengthNumber.value = String(this.minGravityLength);
+        this.gravityLengthNumber.setAttribute('aria-label', 'Minimum skeleton length pixels');
+        const updateGravityLength = (value: number) => {
+            if (!Number.isFinite(value)) return;
+            this.minGravityLength = Math.max(0, Math.min(200, Math.round(value)));
+            this.gravityLengthSlider.value = this.gravityLengthNumber.value = String(this.minGravityLength);
+            if (this.last) this.drawGravityPanel(this.last);
+        };
+        this.gravityLengthSlider.addEventListener('input', () => updateGravityLength(Number(this.gravityLengthSlider.value)));
+        this.gravityLengthNumber.addEventListener('change', () => updateGravityLength(Number(this.gravityLengthNumber.value)));
+        const gravityTrunkLabel = document.createElement('label');
+        gravityTrunkLabel.className = 'live-junction-toggle';
+        this.gravityTrunkCheckbox = document.createElement('input');
+        this.gravityTrunkCheckbox.type = 'checkbox';
+        this.gravityTrunkCheckbox.checked = this.excludeGravityTrunks;
+        this.gravityTrunkCheckbox.setAttribute('aria-label', 'Exclude trunk objects');
+        this.gravityTrunkCheckbox.addEventListener('change', () => {
+            this.excludeGravityTrunks = this.gravityTrunkCheckbox.checked;
+            if (this.last) this.drawGravityPanel(this.last);
+        });
+        gravityTrunkLabel.append(this.gravityTrunkCheckbox, document.createTextNode('Exclude trunks'));
+        gravityLengthControls.append(gravityLengthLabel, this.gravityLengthSlider, this.gravityLengthNumber,
+            document.createTextNode('px'), gravityTrunkLabel);
+        const gravityGrid = document.createElement('div'); gravityGrid.className = 'live-junction-grid';
+        const gravityView = (label: string) => {
+            const view = document.createElement('div'); view.className = 'live-junction-view';
+            const canvas = document.createElement('canvas'); canvas.width = canvas.height = 640;
+            const caption = document.createElement('div'); caption.className = 'live-junction-label';
+            caption.textContent = label; view.append(canvas, caption); gravityGrid.append(view);
+            return { canvas, caption };
+        };
+        const gravityInput = gravityView('Component gate · waiting for depth');
+        const gravityFiltered = gravityView('Near-horizontal · waiting for depth');
+        this.gravityInputCanvas = gravityInput.canvas; this.gravityInputLabel = gravityInput.caption;
+        this.gravityFilteredCanvas = gravityFiltered.canvas; this.gravityFilteredLabel = gravityFiltered.caption;
+        this.gravitySummary = document.createElement('div'); this.gravitySummary.className = 'live-junction-summary';
+        this.gravitySummary.textContent = 'Individual PCA components and merged objects will be checked against gravity.';
+        gravityTile.append(gravityTitle, gravityControls, gravityLengthControls, gravityGrid, this.gravitySummary);
+        grid.append(gravityTile);
         this.status = document.createElement('div');
         this.status.className = 'live-status';
         const save = document.createElement('div');
@@ -475,7 +764,8 @@ class LiveView {
         }
         if (this.capturing) return;
         if (this.busy || this.scene.camera.targetSizeOverride || this.scene.lockedRenderMode ||
-            this.getLegacyCaptureRunning() || (this.manager.classList.contains('collapsed') && !this.showMainLanding) ||
+            this.getLegacyCaptureRunning() || (this.manager.classList.contains('collapsed') &&
+                (this.viewMode === 'raw' || !this.showMainLanding)) ||
             performance.now() - this.changedAt < 400 || key === this.attempted) return;
         this.attempted = key;
         this.capture(source, key).catch((error) => {
@@ -576,10 +866,23 @@ class LiveView {
             this.drawMask();
             this.depthPreview.getContext('2d').clearRect(0, 0, 640, 640);
             this.branchCanvas.getContext('2d').clearRect(0, 0, 640, 640);
-            this.branchList.textContent = 'Computing depth…';
+            this.branchList.textContent = 'Skeletonizing visible segmentation…';
+            this.drawJunctionComparison(snapshot);
+            this.drawPcaPanel(snapshot);
             this.status.parentElement.dataset.frameId = frameId;
             this.status.parentElement.dataset.stale = 'false';
-            this.message('inferring', 'RGB / mask / pose ready · computing DA2 relative depth…');
+            this.message('skeletonizing', 'RGB / mask / pose ready · computing raw skeleton…');
+            const raw = await this.detectRawSkeleton(snapshot);
+            if (!this.enabled || key !== this.viewFingerprint(this.getSource())) return;
+            snapshot.rawSkeleton = raw.skeleton;
+            snapshot.rawSkeletonCount = raw.count;
+            snapshot.rawJunctions = raw.junctions;
+            snapshot.linkLabels = raw.linkLabels;
+            snapshot.linkCount = raw.linkCount;
+            this.drawBranches(snapshot);
+            this.drawJunctionComparison(snapshot);
+            this.drawPcaPanel(snapshot);
+            this.message('inferring', 'Raw skeleton ready · computing DA2 relative depth…');
             const png = originalRgb.toDataURL('image/png').split(',')[1];
             const response = await fetch('/api/depth', {
                 method: 'POST',
@@ -627,8 +930,10 @@ class LiveView {
             if (!this.enabled || key !== this.viewFingerprint(this.getSource())) return;
             snapshot.detection = detection;
             this.drawBranches(snapshot);
+            this.drawJunctionComparison(snapshot);
+            this.drawPcaPanel(snapshot);
             this.saveButton.disabled = this.saving;
-            this.message('ready', `${frameId} · ${detection.branches.length} branches · CPU ${detection.cpu_ms.toFixed(1)}ms · DA2 ${Math.round(info.inference_ms)}ms · total ${Math.round(performance.now() - started)}ms`);
+            this.message('ready', `${frameId} · raw skeleton ${snapshot.rawSkeletonCount} px · ${detection.branches.length} branch paths computed · CPU ${detection.cpu_ms.toFixed(1)}ms · DA2 ${Math.round(info.inference_ms)}ms · total ${Math.round(performance.now() - started)}ms`);
         } finally {
             this.busy = false;
         }
@@ -656,6 +961,39 @@ class LiveView {
             }
             ctx.drawImage(pixelCanvas(pixels.data, 640, 640), 0, 0);
         }
+    }
+
+    detectRawSkeleton(snapshot: LiveSnapshot): Promise<{ skeleton: Uint8Array; count: number; junctions: JunctionMarker[]; linkLabels: Uint32Array; linkCount: number }> {
+        if (!this.detectorWorker) {
+            this.detectorWorker = new Worker(new URL('static/lib/branch-detector/worker.mjs', document.baseURI), { type: 'module' });
+        }
+        const worker = this.detectorWorker;
+        const rgba = snapshot.mask.getContext('2d').getImageData(0, 0, 640, 640).data;
+        const mask = new Uint8Array(640 * 640);
+        for (let i = 0; i < mask.length; i++) mask[i] = rgba[i * 4];
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                worker.terminate(); this.detectorWorker = null;
+                reject(new Error('Raw skeleton worker timed out'));
+            }, 10000);
+            worker.onmessage = ({ data }) => {
+                if (data.frameId !== snapshot.frameId) return;
+                clearTimeout(timeout); worker.onerror = null;
+                if (data.error) reject(new Error(data.error));
+                else if (data.type !== 'raw-skeleton' || data.width !== 320 || data.height !== 320 ||
+                    data.skeleton?.length !== 320 * 320 || !Array.isArray(data.junctions) ||
+                    data.linkLabels?.length !== 320 * 320 || !Number.isInteger(data.linkCount)) {
+                    reject(new Error('Unexpected raw skeleton response'));
+                } else resolve({ skeleton: data.skeleton, count: data.count, junctions: data.junctions,
+                    linkLabels: data.linkLabels, linkCount: data.linkCount });
+            };
+            worker.onerror = (event) => {
+                clearTimeout(timeout);
+                worker.terminate(); this.detectorWorker = null;
+                reject(new Error(`Raw skeleton worker failed: ${event.message}`));
+            };
+            worker.postMessage({ type: 'raw-skeleton', frameId: snapshot.frameId, mask }, [mask.buffer]);
+        });
     }
 
     detectBranches(snapshot: LiveSnapshot): Promise<BranchDetection> {
@@ -730,7 +1068,7 @@ class LiveView {
     }
 
     drawMainLanding(snapshot: LiveSnapshot, view: BranchView) {
-        if (!this.enabled || !this.showMainLanding || snapshot !== this.last ||
+        if (!this.enabled || this.viewMode !== 'candidates' || !this.showMainLanding || snapshot !== this.last ||
             snapshot.fingerprint !== this.viewFingerprint(this.getSource())) {
             this.hideMainLanding();
             return;
@@ -775,7 +1113,335 @@ class LiveView {
         this.mainOverlay.style.visibility = view.landing.length ? 'visible' : 'hidden';
     }
 
+    comparisonCrop(snapshot: LiveSnapshot) {
+        if (snapshot.comparisonCrop) return snapshot.comparisonCrop;
+        let minX = 320, minY = 320, maxX = -1, maxY = -1;
+        snapshot.rawSkeleton?.forEach((value, index) => {
+            if (!value) return;
+            const x = index % 320, y = Math.floor(index / 320);
+            minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+            minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+        });
+        if (maxX < 0) return { x: 0, y: 0, size: 640 };
+        const span = Math.max(maxX - minX + 1, maxY - minY + 1) * 2;
+        const size = Math.min(640, Math.max(96, span * 1.5));
+        const x = Math.max(0, Math.min(640 - size, minX + maxX + 1 - size / 2));
+        const y = Math.max(0, Math.min(640 - size, minY + maxY + 1 - size / 2));
+        snapshot.comparisonCrop = { x, y, size };
+        return snapshot.comparisonCrop;
+    }
+
+    drawComparisonLayer(ctx: CanvasRenderingContext2D, image: HTMLCanvasElement, snapshot: LiveSnapshot) {
+        const crop = this.comparisonCrop(snapshot);
+        ctx.drawImage(image, crop.x, crop.y, crop.size, crop.size, 0, 0, 640, 640);
+    }
+
+    paintRawSkeleton(ctx: CanvasRenderingContext2D, snapshot: LiveSnapshot, detail = false) {
+        ctx.clearRect(0, 0, 640, 640);
+        if (detail) this.drawComparisonLayer(ctx, snapshot.rgb, snapshot);
+        else ctx.drawImage(snapshot.rgb, 0, 0);
+        if (!snapshot.rawSkeleton) return;
+        if (!snapshot.rawOverlay) {
+            const mask = snapshot.mask.getContext('2d').getImageData(0, 0, 640, 640).data;
+            const pixels = new Uint8ClampedArray(640 * 640 * 4);
+            for (let y = 0; y < 640; y++) for (let x = 0; x < 640; x++) {
+                const i = y * 640 + x;
+                if (!mask[i * 4] || !snapshot.rawSkeleton[(y >> 1) * 320 + (x >> 1)]) continue;
+                pixels[i * 4] = 255;
+                pixels[i * 4 + 1] = 30;
+                pixels[i * 4 + 2] = 215;
+                pixels[i * 4 + 3] = 255;
+            }
+            snapshot.rawOverlay = pixelCanvas(pixels, 640, 640);
+        }
+        if (detail) this.drawComparisonLayer(ctx, snapshot.rawOverlay, snapshot);
+        else ctx.drawImage(snapshot.rawOverlay, 0, 0);
+    }
+
+    drawRawSkeleton(snapshot: LiveSnapshot) {
+        this.paintRawSkeleton(this.branchCanvas.getContext('2d'), snapshot);
+        this.branchCanvas.parentElement.querySelector('.live-tile-title').textContent = 'Raw skeleton · magenta on RGB';
+        if (!snapshot.rawSkeleton) {
+            this.branchList.textContent = 'Skeletonizing visible segmentation…';
+            return;
+        }
+        this.branchList.textContent = `${snapshot.rawSkeletonCount} skeleton pixels at 320×320 · visible segmentation only · no depth, size, angle, trunk or ranking filters`;
+    }
+
+    paintLinkSegmentation(ctx: CanvasRenderingContext2D, snapshot: LiveSnapshot, depthAware: boolean) {
+        ctx.clearRect(0, 0, 640, 640);
+        this.drawComparisonLayer(ctx, snapshot.rgb, snapshot);
+        const labels = depthAware ? snapshot.detection?.depthLinkLabels : snapshot.linkLabels;
+        if (!labels) return;
+        const cacheKey = depthAware ? 'depthLinkOverlay' : 'linkOverlay';
+        if (!snapshot[cacheKey]) {
+            snapshot[cacheKey] = this.linkOverlay(snapshot, labels);
+        }
+        this.drawComparisonLayer(ctx, snapshot[cacheKey], snapshot);
+    }
+
+    linkOverlay(snapshot: LiveSnapshot, labels: Uint32Array) {
+        const mask = snapshot.mask.getContext('2d').getImageData(0, 0, 640, 640).data;
+        const pixels = new Uint8ClampedArray(640 * 640 * 4);
+        for (let y = 0; y < 640; y++) for (let x = 0; x < 640; x++) {
+            const p = y * 640 + x, id = labels[(y >> 1) * 320 + (x >> 1)];
+            if (!id || !mask[p * 4]) continue;
+            const color = branchPalette[((id - 1) % 254) + 1];
+            pixels[p * 4] = color[0]; pixels[p * 4 + 1] = color[1]; pixels[p * 4 + 2] = color[2];
+            pixels[p * 4 + 3] = 225;
+        }
+        return pixelCanvas(pixels, 640, 640);
+    }
+
+    buildPcaGroups(snapshot: LiveSnapshot, allowedIds?: Set<number>) {
+        const detection = snapshot.detection;
+        const parent = new Map<number, number>();
+        for (const id of detection.depthLinkLabels) if (id && (!allowedIds || allowedIds.has(id))) parent.set(id, id);
+        const members = new Map<number, PcaObject[]>(detection.pcaObjects
+            .filter(object => !allowedIds || allowedIds.has(object.id)).map(object => [object.id, [object]]));
+        const root = (value: number) => {
+            while (parent.get(value) !== value) value = parent.get(value);
+            return value;
+        };
+        let merges = 0;
+        for (const edge of detection.pcaAdjacency) {
+            if (!edge.eligible || edge.angleDeg > this.pcaMaxAngle || !parent.has(edge.a) || !parent.has(edge.b)) continue;
+            const a = root(edge.a), b = root(edge.b);
+            if (a === b) continue;
+            const coherent = members.get(a).every(left => members.get(b).every(right =>
+                Math.acos(Math.min(1, Math.abs(left.axis.reduce((sum, value, k) =>
+                    sum + value * right.axis[k], 0)))) * 180 / Math.PI <= this.pcaMaxAngle));
+            if (!coherent) continue;
+            const keep = Math.min(a, b), drop = Math.max(a, b);
+            parent.set(drop, keep);
+            members.get(keep).push(...members.get(drop)); members.delete(drop);
+            merges++;
+        }
+        const merged = new Uint32Array(detection.depthLinkLabels.length);
+        for (let i = 0; i < merged.length; i++) {
+            const id = detection.depthLinkLabels[i]; if (parent.has(id)) merged[i] = root(id);
+        }
+        const pooled = new Map<number, { pixels: number; sum: number[]; outer: number[];
+            centerlineLengthPx: number; trunkCenterlineLengthPx: number; detectorCenterlineLengthPx: number }>();
+        for (const id of parent.keys()) {
+            const group = root(id);
+            if (!pooled.has(group)) pooled.set(group, { pixels: 0, sum: [0, 0, 0], outer: Array(9).fill(0),
+                centerlineLengthPx: 0, trunkCenterlineLengthPx: 0, detectorCenterlineLengthPx: 0 });
+        }
+        for (const object of detection.pcaObjects) {
+            if (!parent.has(object.id)) continue;
+            const group = pooled.get(root(object.id));
+            group.pixels += object.pixels;
+            group.centerlineLengthPx += object.centerlineLengthPx;
+            group.trunkCenterlineLengthPx += object.trunkCenterlineLengthPx;
+            group.detectorCenterlineLengthPx += object.detectorCenterlineLengthPx;
+            for (let i = 0; i < 3; i++) group.sum[i] += object.moments.sum[i];
+            for (let i = 0; i < 9; i++) group.outer[i] += object.moments.outer[i];
+        }
+        const upAxis = snapshot.pose.world_up_axis === 'z' ? 2 : 1;
+        const objects: GravityObject[] = [...pooled].map(([id, moments]) => {
+            const fit = principalAxisFromMoments(moments.pixels, moments.sum, moments.outer);
+            return { id, pixels: moments.pixels, axis: fit.axis, linearity: fit.linearity,
+                reliable: fit.reliable, angleToGravityDeg: fit.reliable ?
+                    Math.acos(Math.min(1, Math.abs(fit.axis[upAxis]))) * 180 / Math.PI : null,
+                centerlineLengthPx: moments.centerlineLengthPx,
+                trunkCenterlineLengthPx: moments.trunkCenterlineLengthPx,
+                detectorCenterlineLengthPx: moments.detectorCenterlineLengthPx,
+                isTrunk: moments.trunkCenterlineLengthPx >= 6 &&
+                    moments.trunkCenterlineLengthPx / Math.max(1, moments.centerlineLengthPx) >= 0.35 };
+        }).sort((a, b) => a.id - b.id);
+        return { labels: merged, count: parent.size - merges, objects, merges };
+    }
+
+    mergePcaLabels(snapshot: LiveSnapshot) {
+        if (snapshot.pcaMergedAngle === this.pcaMaxAngle && snapshot.pcaMergedLabels && snapshot.pcaMergedObjects) return 0;
+        const merged = this.buildPcaGroups(snapshot);
+        snapshot.pcaMergedLabels = merged.labels;
+        snapshot.pcaMergedCount = merged.count;
+        snapshot.pcaMergedAngle = this.pcaMaxAngle;
+        snapshot.pcaMergedObjects = merged.objects;
+        snapshot.pcaMergedOverlay = this.linkOverlay(snapshot, merged.labels);
+        snapshot.gravityFilteredLabels = undefined;
+        snapshot.gravityFilteredOverlay = undefined;
+        snapshot.gravityFilterKey = undefined;
+        return merged.merges;
+    }
+
+    drawPcaPanel(snapshot: LiveSnapshot) {
+        const input = this.pcaInputCanvas.getContext('2d');
+        const output = this.pcaMergedCanvas.getContext('2d');
+        if (!snapshot.detection?.pcaObjects) {
+            for (const ctx of [input, output]) {
+                ctx.clearRect(0, 0, 640, 640);
+                ctx.globalAlpha = 0.35; this.drawComparisonLayer(ctx, snapshot.rgb, snapshot); ctx.globalAlpha = 1;
+            }
+            this.pcaInputLabel.textContent = 'DA2 segments · waiting for relative depth';
+            this.pcaMergedLabel.textContent = 'PCA merged · waiting for relative depth';
+            this.pcaSummary.textContent = 'Each DA2 segment will get a pseudo-3D PCA axis.';
+            this.drawGravityPanel(snapshot);
+            return;
+        }
+        const detection = snapshot.detection;
+        this.paintLinkSegmentation(input, snapshot, true);
+        const crop = this.comparisonCrop(snapshot), zoom = 640 / crop.size;
+        let reliable = 0;
+        for (const object of detection.pcaObjects) {
+            if (!object.reliable || !object.endpointsPx?.[0] || !object.endpointsPx?.[1]) continue;
+            const [[x0, y0], [x1, y1]] = object.endpointsPx;
+            const dx = (x1 - x0) * zoom, dy = (y1 - y0) * zoom;
+            const length = Math.hypot(dx, dy);
+            if (length < 1e-6) continue;
+            reliable++;
+            const half = Math.min(55, Math.max(12, length / 2));
+            const cx = (object.centerPx[0] - crop.x) * zoom;
+            const cy = (object.centerPx[1] - crop.y) * zoom;
+            input.beginPath(); input.moveTo(cx - dx / length * half, cy - dy / length * half);
+            input.lineTo(cx + dx / length * half, cy + dy / length * half);
+            input.strokeStyle = '#06131b'; input.lineWidth = 6; input.stroke();
+            input.strokeStyle = '#f8fcff'; input.lineWidth = 2.5; input.stroke();
+            input.beginPath(); input.arc(cx, cy, 3, 0, Math.PI * 2);
+            input.fillStyle = '#06212b'; input.fill();
+        }
+        const merges = this.mergePcaLabels(snapshot);
+        output.clearRect(0, 0, 640, 640);
+        this.drawComparisonLayer(output, snapshot.rgb, snapshot);
+        this.drawComparisonLayer(output, snapshot.pcaMergedOverlay, snapshot);
+        this.pcaInputLabel.textContent = `DA2 input · ${detection.depthLinkCount} objects · ${reliable} reliable PCA axes (white)`;
+        this.pcaMergedLabel.textContent = `PCA merged · ${snapshot.pcaMergedCount} objects · ${detection.depthLinkCount - snapshot.pcaMergedCount} merges`;
+        this.pcaSummary.textContent = `Adjacent objects merge when every pair of reliable 3D axes differs by ≤${this.pcaMaxAngle}° and the local DA2 gap is ≤15% of the frame range. Axis direction is sign-free; relative depth yields dimensionless pseudo-3D, not metric geometry.`;
+        this.drawGravityPanel(snapshot);
+    }
+
+    drawGravityPanel(snapshot: LiveSnapshot) {
+        const input = this.gravityInputCanvas.getContext('2d');
+        const output = this.gravityFilteredCanvas.getContext('2d');
+        if (!snapshot.pcaMergedLabels || !snapshot.pcaMergedObjects) {
+            for (const ctx of [input, output]) {
+                ctx.clearRect(0, 0, 640, 640);
+                ctx.globalAlpha = 0.35; this.drawComparisonLayer(ctx, snapshot.rgb, snapshot); ctx.globalAlpha = 1;
+            }
+            this.gravityInputLabel.textContent = 'Component gate · waiting for relative depth';
+            this.gravityFilteredLabel.textContent = 'Near-horizontal · waiting for relative depth';
+            this.gravitySummary.textContent = 'Individual PCA components and merged objects will be checked against gravity.';
+            return;
+        }
+        const mergeKey = `${this.pcaMaxAngle}:${this.gravityTolerance}`;
+        if (snapshot.gravityMergedKey !== mergeKey || !snapshot.gravityMergedLabels) {
+            const upAxis = snapshot.pose.world_up_axis === 'z' ? 2 : 1;
+            const eligible = new Set(snapshot.detection.pcaObjects.filter(object => object.reliable &&
+                90 - Math.acos(Math.min(1, Math.abs(object.axis[upAxis]))) * 180 / Math.PI <= this.gravityTolerance)
+                .map(object => object.id));
+            const merged = this.buildPcaGroups(snapshot, eligible);
+            snapshot.gravityMergedLabels = merged.labels;
+            snapshot.gravityMergedObjects = merged.objects;
+            snapshot.gravityMergedOverlay = this.linkOverlay(snapshot, merged.labels);
+            snapshot.gravityEligibleCount = eligible.size;
+            snapshot.gravityMergedKey = mergeKey;
+            snapshot.gravityFilterKey = undefined;
+        }
+        input.clearRect(0, 0, 640, 640);
+        this.drawComparisonLayer(input, snapshot.rgb, snapshot);
+        this.drawComparisonLayer(input, snapshot.gravityMergedOverlay, snapshot);
+        const objects = snapshot.gravityMergedObjects;
+        const accepted = new Set(objects.filter(object => object.reliable &&
+            90 - object.angleToGravityDeg <= this.gravityTolerance &&
+            object.centerlineLengthPx >= this.minGravityLength &&
+            (!this.excludeGravityTrunks || !object.isTrunk)).map(object => object.id));
+        const filterKey = `${mergeKey}:${this.minGravityLength}:${this.excludeGravityTrunks}`;
+        if (snapshot.gravityFilterKey !== filterKey || !snapshot.gravityFilteredLabels) {
+            const labels = new Uint32Array(snapshot.gravityMergedLabels.length);
+            for (let i = 0; i < labels.length; i++) {
+                const id = snapshot.gravityMergedLabels[i];
+                if (accepted.has(id)) labels[i] = id;
+            }
+            snapshot.gravityFilteredLabels = labels;
+            snapshot.gravityFilteredOverlay = this.linkOverlay(snapshot, labels);
+            snapshot.gravityFilterKey = filterKey;
+        }
+        output.clearRect(0, 0, 640, 640);
+        output.globalAlpha = 0.45; this.drawComparisonLayer(output, snapshot.rgb, snapshot); output.globalAlpha = 1;
+        this.drawComparisonLayer(output, snapshot.gravityFilteredOverlay, snapshot);
+        const reliable = objects.filter(object => object.reliable).length;
+        this.gravityInputLabel.textContent = `Component gate · ${snapshot.gravityEligibleCount} / ${snapshot.detection.pcaObjects.length} PCA axes kept · ${objects.length} merged objects`;
+        this.gravityFilteredLabel.textContent = `Near-horizontal · ${accepted.size} / ${objects.length} objects kept`;
+        const trunkCount = objects.filter(object => object.isTrunk).length;
+        this.gravitySummary.textContent = `First keep reliable DA2 PCA components ${90 - this.gravityTolerance}–90° from gravity; merge those survivors, then check each merged axis against the same angle. Keep raw-skeleton centerlines ≥${this.minGravityLength} px. Trunk exclusion ${this.excludeGravityTrunks ? 'on' : 'off'} (${trunkCount} trunk-like objects); world ${snapshot.pose.world_up_axis?.toUpperCase() ?? 'Y'} is up. Length is image pixels, not meters; DA2 geometry remains relative pseudo-3D.`;
+    }
+
+    drawJunctionComparison(snapshot: LiveSnapshot) {
+        const plain = this.junctionNoDepthCanvas.getContext('2d');
+        const guided = this.junctionDepthCanvas.getContext('2d');
+        const compared = snapshot.detection?.junctionComparison;
+        if (!this.showJunctions) {
+            this.paintLinkSegmentation(plain, snapshot, false);
+            this.junctionNoDepthLabel.textContent = snapshot.linkLabels ?
+                `2D only · ${snapshot.linkCount} colored links` : '2D only · waiting for raw skeleton';
+            if (compared) {
+                this.paintLinkSegmentation(guided, snapshot, true);
+                const depthCount = snapshot.detection.depthLinkCount;
+                this.junctionDepthLabel.textContent = `With DA2 · ${depthCount} separate objects (2D: ${snapshot.linkCount}, extra cuts: ${snapshot.detection.depthLinkCuts + snapshot.detection.depthJunctionCuts})`;
+                const separated = compared.filter(item => item.status === 'depth-separated').length;
+                const similar = compared.filter(item => item.status === 'similar-depth').length;
+                const uncertain = compared.length - separated - similar;
+                this.junctionSummary.textContent = `Zoomed to the raw skeleton. Every junction arm keeps a separate object ID, including similar-depth arms. DA2 can add cuts where depth jumps within a link; no junction arms are rejoined. Junctions: ${separated} depth-disagree / ${similar} similar / ${uncertain} uncertain.`;
+            } else {
+                guided.clearRect(0, 0, 640, 640);
+                guided.globalAlpha = 0.35; this.drawComparisonLayer(guided, snapshot.rgb, snapshot); guided.globalAlpha = 1;
+                this.junctionDepthLabel.textContent = 'With DA2 · waiting for relative depth';
+                this.junctionSummary.textContent = 'Colors identify 2D links between junctions. Depth-guided grouping appears when DA2 finishes.';
+            }
+            return;
+        }
+        this.paintRawSkeleton(plain, snapshot, true);
+        const markers = (ctx: CanvasRenderingContext2D, items: JunctionMarker[], color: (item: JunctionMarker) => string) => {
+            ctx.lineWidth = 3;
+            const crop = this.comparisonCrop(snapshot), zoom = 640 / crop.size;
+            for (const item of items) {
+                ctx.beginPath(); ctx.arc((item.x - crop.x) * zoom, (item.y - crop.y) * zoom,
+                    Math.max(8, 8 * zoom), 0, Math.PI * 2);
+                ctx.fillStyle = 'rgba(5, 12, 18, 0.8)'; ctx.fill();
+                ctx.strokeStyle = color(item); ctx.stroke();
+            }
+        };
+        if (snapshot.rawJunctions) {
+            markers(plain, snapshot.rawJunctions, () => '#ffe45c');
+            this.junctionNoDepthLabel.textContent = `2D only · ${snapshot.rawJunctions.length} topological junctions`;
+        } else {
+            this.junctionNoDepthLabel.textContent = '2D only · waiting for raw skeleton';
+        }
+        if (compared) {
+            this.paintRawSkeleton(guided, snapshot, true);
+            markers(guided, compared, item => {
+                const status = (item as DepthJunctionMarker).status;
+                return status === 'depth-separated' ? '#ff775c' :
+                    status === 'similar-depth' ? '#50efbf' : '#becbd6';
+            });
+            const separated = compared.filter(item => item.status === 'depth-separated').length;
+            const similar = compared.filter(item => item.status === 'similar-depth').length;
+            const uncertain = compared.length - separated - similar;
+            this.junctionDepthLabel.textContent = `With DA2 · ${separated} depth-disagree / ${similar} similar / ${uncertain} uncertain`;
+            this.junctionSummary.textContent = 'Yellow: every 2D junction · teal: similar arm depths · orange: depth disagreement · gray: insufficient depth. Gap ≥15% of this frame’s robust relative-depth range is a separation cue, not proof of physical connectivity.';
+        } else {
+            guided.clearRect(0, 0, 640, 640);
+            guided.globalAlpha = 0.35; this.drawComparisonLayer(guided, snapshot.rgb, snapshot); guided.globalAlpha = 1;
+            this.junctionDepthLabel.textContent = 'With DA2 · waiting for relative depth';
+            this.junctionSummary.textContent = 'Yellow: every 2D junction. Depth comparison appears when DA2 finishes.';
+        }
+    }
+
     drawBranches(snapshot: LiveSnapshot) {
+        if (this.viewMode === 'raw') {
+            this.drawRawSkeleton(snapshot);
+            this.hideMainLanding();
+            return;
+        }
+        this.branchCanvas.parentElement.querySelector('.live-tile-title').textContent = 'Landing candidates · top K';
+        if (!snapshot.detection) {
+            this.branchCanvas.getContext('2d').drawImage(snapshot.rgb, 0, 0);
+            this.branchList.textContent = 'Waiting for synchronized depth and branch candidates…';
+            this.hideMainLanding();
+            return;
+        }
         const detection = snapshot.detection;
         const view = this.branchView(snapshot);
         const ctx = this.branchCanvas.getContext('2d');

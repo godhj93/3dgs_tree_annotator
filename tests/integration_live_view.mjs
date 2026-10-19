@@ -128,7 +128,9 @@ try {
         live.landingTopK=3;
         live.horizontalAngle=45;const wideAngle=live.branchView(fake);live.horizontalAngle=25;
         live.excludeTrunk=true;const filtered=live.branchView(fake);live.excludeTrunk=false;
-        live.drawBranches(fake);const list=live.branchList.textContent;live.drawBranches(snapshot);
+        live.viewMode='candidates';
+        live.drawBranches(fake);const list=live.branchList.textContent;
+        live.viewMode='raw';live.drawBranches(snapshot);
         return {count:raw.branches.length,trunks:raw.branches.filter(b=>b.is_trunk).map(b=>b.id),
             horizontal:raw.horizontal.map(b=>b.id),wideHorizontal:wideAngle.horizontal.map(b=>b.id),
             topOne:topOne.landing.map(b=>b.id),topOneMaskIds:[...new Set(topOne.landingMask)].filter(Boolean),
@@ -292,6 +294,225 @@ try {
     assert.ok(dji.cameraUp[2] > 0.9, 'the DJI view should appear upright in its Z-up scene');
     assert.deepEqual(unexpectedBrowserErrors(), [], 'application should not report browser/render errors');
 
+    const djiLinks = await evaluate(`(() => {
+        const live=scene.events.invoke('annotation.panel').liveView,snapshot=scene.events.invoke('annotation.liveSnapshot');
+        const mask=snapshot.mask.getContext('2d').getImageData(0,0,640,640).data;
+        const left=snapshot.linkOverlay.getContext('2d').getImageData(0,0,640,640).data;
+        const right=snapshot.depthLinkOverlay.getContext('2d').getImageData(0,0,640,640).data;
+        let colored=0,outside=0,depthChanged=0,changedLabels=0;
+        const colors=new Set(),ids=new Set(snapshot.linkLabels),depthIds=new Set(snapshot.detection.depthLinkLabels);
+        for(let i=0;i<snapshot.linkLabels.length;i++)if(snapshot.linkLabels[i]!==snapshot.detection.depthLinkLabels[i])changedLabels++;
+        for(let i=0;i<640*640;i++)if(left[i*4+3]){
+            colored++;if(!mask[i*4])outside++;
+            if(left[i*4]!==right[i*4]||left[i*4+1]!==right[i*4+1]||left[i*4+2]!==right[i*4+2])depthChanged++;
+            colors.add([left[i*4],left[i*4+1],left[i*4+2]].join(','));
+        }
+        return {checked:live.junctionCheckbox.checked,count:snapshot.linkCount,
+            depthCount:snapshot.detection.depthLinkCount,depthCuts:snapshot.detection.depthLinkCuts,
+            armIds:snapshot.detection.depthJunctionArmIds,
+            labelSize:snapshot.linkLabels.length,
+            depthLabelSize:snapshot.detection.depthLinkLabels.length,depthUsed:depthIds.size-1,changedLabels,
+            cropSize:snapshot.comparisonCrop?.size,
+            used:ids.size-1,colored,outside,colors:colors.size,depthChanged,
+            leftLabel:live.junctionNoDepthLabel.textContent,rightLabel:live.junctionDepthLabel.textContent};
+    })()`);
+    assert.equal(djiLinks.checked,false,'colored links should be the default');
+    assert.equal(djiLinks.labelSize,320*320);
+    assert.equal(djiLinks.depthLabelSize,320*320);
+    assert.ok(djiLinks.cropSize<640,'the comparison should zoom into the raw skeleton');
+    assert.ok(djiLinks.count>1 && djiLinks.used>1 && djiLinks.colors>1);
+    assert.ok(djiLinks.depthCount>=djiLinks.count,
+        'DA2 must never rejoin arms that were separated at a 2D junction');
+    assert.ok(djiLinks.depthCuts>=0);
+    for (const ids of djiLinks.armIds) {
+        assert.ok(ids.every(Boolean),'every junction arm must have an object ID');
+        assert.equal(new Set(ids).size,ids.length,'junction arms must have distinct object IDs');
+    }
+    assert.equal(djiLinks.depthUsed,djiLinks.depthCount);
+    assert.ok(djiLinks.colored>0);
+    if (djiLinks.depthCuts>0) assert.ok(djiLinks.changedLabels>0 && djiLinks.depthChanged>0);
+    assert.equal(djiLinks.outside,0,'colored links must stay inside visible segmentation');
+    assert.match(djiLinks.leftLabel,/colored links/);
+    assert.match(djiLinks.rightLabel,/separate objects/);
+    console.log(JSON.stringify({djiLinks:{count:djiLinks.count,depthCount:djiLinks.depthCount,
+        depthCuts:djiLinks.depthCuts,changedLabels:djiLinks.changedLabels,
+        armIds:djiLinks.armIds}}));
+    const pca = await evaluate(`(() => {
+        const live=scene.events.invoke('annotation.panel').liveView,s=scene.events.invoke('annotation.liveSnapshot');
+        const input=s.detection.depthLinkLabels,merged=s.pcaMergedLabels;
+        const before={frame:s.frameId,angle:live.pcaMaxAngle,input:s.detection.depthLinkCount,
+            output:s.pcaMergedCount,objects:s.detection.pcaObjects.length,
+            reliable:s.detection.pcaObjects.filter(o=>o.reliable).length,
+            edges:s.detection.pcaAdjacency.length,eligible:s.detection.pcaAdjacency.filter(e=>e.eligible).length,
+            inputLength:input.length,mergedLength:merged.length,
+            axesCaption:live.pcaInputLabel.textContent,mergedCaption:live.pcaMergedLabel.textContent};
+        const slider=live.pcaAngleSlider;
+        slider.value='0';slider.dispatchEvent(new Event('input',{bubbles:true}));
+        const atZero=s.pcaMergedCount;
+        slider.value='90';slider.dispatchEvent(new Event('input',{bubbles:true}));
+        const atNinety=s.pcaMergedCount;
+        const changed=merged.some((id,i)=>id!==s.pcaMergedLabels[i]);
+        const mask=s.mask.getContext('2d').getImageData(0,0,640,640).data;
+        const overlay=s.pcaMergedOverlay.getContext('2d').getImageData(0,0,640,640).data;
+        let outside=0,colored=0;
+        for(let i=0;i<640*640;i++)if(overlay[i*4+3]){colored++;if(!mask[i*4])outside++;}
+        slider.value='20';slider.dispatchEvent(new Event('input',{bubbles:true}));
+        return {...before,atZero,atNinety,changed,colored,outside,
+            sameFrame:s===scene.events.invoke('annotation.liveSnapshot'),
+            numberValue:live.pcaAngleNumber.value};
+    })()`);
+    assert.equal(pca.angle,20);
+    assert.equal(pca.inputLength,320*320);
+    assert.equal(pca.mergedLength,320*320);
+    assert.ok(pca.objects>0 && pca.reliable>0);
+    assert.ok(pca.output<=pca.input);
+    assert.ok(pca.atNinety<=pca.atZero);
+    if (pca.eligible>0) assert.ok(pca.atNinety<pca.atZero && pca.changed);
+    assert.ok(pca.colored>0 && pca.sameFrame);
+    assert.equal(pca.outside,0);
+    assert.equal(pca.numberValue,'20');
+    assert.match(pca.axesCaption,/PCA axes/);
+    assert.match(pca.mergedCaption,/PCA merged/);
+    console.log(JSON.stringify({djiPca:pca}));
+    const gravity = await evaluate(`(() => {
+        const live=scene.events.invoke('annotation.panel').liveView,s=scene.events.invoke('annotation.liveSnapshot');
+        const objects=s.gravityMergedObjects,up=s.pose.world_up_axis==='z'?2:1;
+        const eligible=new Set(s.detection.pcaObjects.filter(o=>o.reliable &&
+            90-Math.acos(Math.min(1,Math.abs(o.axis[up])))*180/Math.PI<=live.gravityTolerance).map(o=>o.id));
+        let removedPixels=0,incorrectPixels=0;
+        for(let i=0;i<s.detection.depthLinkLabels.length;i++){
+            const source=s.detection.depthLinkLabels[i],kept=s.gravityMergedLabels[i];
+            if(source&&!eligible.has(source)){removedPixels++;if(kept)incorrectPixels++;}
+        }
+        const angleError=Math.max(0,...objects.filter(o=>o.reliable).map(o=>Math.abs(
+            o.angleToGravityDeg-Math.acos(Math.min(1,Math.abs(o.axis[up])))*180/Math.PI)));
+        const before={frame:s.frameId,up:s.pose.world_up_axis,tolerance:live.gravityTolerance,
+            merged:s.pcaMergedCount,objects:objects.length,reliable:objects.filter(o=>o.reliable).length,
+            eligible:s.gravityEligibleCount,expectedEligible:eligible.size,removedPixels,incorrectPixels,
+            selected:new Set(s.gravityFilteredLabels).size-1,
+            minLength:live.minGravityLength,excludeTrunks:live.excludeGravityTrunks,
+            trunkObjects:objects.filter(o=>o.isTrunk).length,
+            lengths:objects.map(o=>o.centerlineLengthPx),
+            angleError,inputLabel:live.gravityInputLabel.textContent,
+            outputLabel:live.gravityFilteredLabel.textContent};
+        const slider=live.gravityAngleSlider;
+        slider.value='0';slider.dispatchEvent(new Event('input',{bubbles:true}));
+        const atZero=new Set(s.gravityFilteredLabels).size-1;
+        slider.value='90';slider.dispatchEvent(new Event('input',{bubbles:true}));
+        const length=live.gravityLengthSlider;
+        length.value='0';length.dispatchEvent(new Event('input',{bubbles:true}));
+        const atNinety=new Set(s.gravityFilteredLabels).size-1;
+        const atNinetyReliable=s.gravityMergedObjects.filter(o=>o.reliable).length;
+        const atNinetyEligible=s.gravityEligibleCount;
+        const wideObjects=s.gravityMergedObjects;
+        length.value='200';length.dispatchEvent(new Event('input',{bubbles:true}));
+        const atLong=new Set(s.gravityFilteredLabels).size-1;
+        length.value='0';length.dispatchEvent(new Event('input',{bubbles:true}));
+        const trunk=live.gravityTrunkCheckbox;
+        trunk.checked=true;trunk.dispatchEvent(new Event('change',{bubbles:true}));
+        const withoutTrunks=new Set(s.gravityFilteredLabels);withoutTrunks.delete(0);
+        const expectedWithoutTrunks=wideObjects.filter(o=>o.reliable&&!o.isTrunk).map(o=>o.id);
+        const mask=s.mask.getContext('2d').getImageData(0,0,640,640).data;
+        const overlay=s.gravityFilteredOverlay.getContext('2d').getImageData(0,0,640,640).data;
+        let colored=0,outside=0;
+        for(let i=0;i<640*640;i++)if(overlay[i*4+3]){colored++;if(!mask[i*4])outside++;}
+        trunk.checked=false;trunk.dispatchEvent(new Event('change',{bubbles:true}));
+        length.value='12';length.dispatchEvent(new Event('input',{bubbles:true}));
+        slider.value='20';slider.dispatchEvent(new Event('input',{bubbles:true}));
+        const kept=new Set(s.gravityFilteredLabels);kept.delete(0);
+        const expected=objects.filter(o=>o.reliable && 90-o.angleToGravityDeg<=20 &&
+            o.centerlineLengthPx>=12).map(o=>o.id);
+        return {...before,atZero,atNinety,atNinetyReliable,atNinetyEligible,atLong,colored,outside,
+            withoutTrunkIds:[...withoutTrunks].sort((a,b)=>a-b),
+            expectedWithoutTrunkIds:expectedWithoutTrunks.sort((a,b)=>a-b),
+            selectedIds:[...kept].sort((a,b)=>a-b),expectedIds:expected.sort((a,b)=>a-b),
+            sameFrame:s===scene.events.invoke('annotation.liveSnapshot'),
+            sixthPanelUnchanged:s.pcaMergedCount===before.merged,
+            sliderValue:live.gravityAngleSlider.value,numberValue:live.gravityAngleNumber.value,
+            lengthValue:live.gravityLengthNumber.value,trunkChecked:live.gravityTrunkCheckbox.checked};
+    })()`);
+    assert.equal(gravity.tolerance,20);
+    assert.equal(gravity.up,'z');
+    assert.ok(gravity.objects<=gravity.eligible);
+    assert.ok(gravity.reliable>0 && gravity.angleError<1e-8);
+    assert.equal(gravity.eligible,gravity.expectedEligible);
+    assert.ok(gravity.removedPixels>0);
+    assert.equal(gravity.incorrectPixels,0,'excluded source components must not enter merged objects');
+    assert.ok(gravity.atZero<=gravity.selected && gravity.selected<=gravity.atNinety);
+    assert.equal(gravity.atNinety,gravity.atNinetyReliable);
+    assert.equal(gravity.atNinetyEligible,pca.reliable);
+    assert.ok(gravity.atLong<=gravity.atNinety);
+    assert.ok(gravity.lengths.some(length=>length>0));
+    assert.deepEqual(gravity.withoutTrunkIds,gravity.expectedWithoutTrunkIds);
+    assert.deepEqual(gravity.selectedIds,gravity.expectedIds);
+    assert.ok(gravity.colored>0 && gravity.sameFrame);
+    assert.equal(gravity.outside,0);
+    assert.equal(gravity.sliderValue,'20');
+    assert.equal(gravity.numberValue,'20');
+    assert.equal(gravity.lengthValue,'12');
+    assert.equal(gravity.trunkChecked,false);
+    assert.equal(gravity.minLength,12);
+    assert.equal(gravity.excludeTrunks,false);
+    assert.equal(gravity.sixthPanelUnchanged,true);
+    assert.match(gravity.inputLabel,/Component gate/);
+    assert.match(gravity.outputLabel,/Near-horizontal/);
+    console.log(JSON.stringify({djiGravity:gravity}));
+    await evaluate(`document.querySelector('.live-gravity-tile').scrollIntoView({block:'center'})`);
+    const gravityShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile('/tmp/annotation_live_dji_gravity_qa.png', Buffer.from(gravityShot.data, 'base64'));
+    await evaluate(`document.querySelector('.live-pca-tile').scrollIntoView({block:'center'})`);
+    const pcaShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile('/tmp/annotation_live_dji_pca_qa.png', Buffer.from(pcaShot.data, 'base64'));
+    await evaluate(`document.querySelector('.live-junction-tile').scrollIntoView({block:'center'})`);
+    const linksShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile('/tmp/annotation_live_dji_links_qa.png', Buffer.from(linksShot.data, 'base64'));
+    await evaluate(`document.querySelector('[aria-label="Show junctions"]').click()`);
+
+    const djiRaw = await evaluate(`(() => {
+        const live=scene.events.invoke('annotation.panel').liveView,snapshot=scene.events.invoke('annotation.liveSnapshot');
+        const raw=snapshot.rawSkeleton,mask=snapshot.mask.getContext('2d').getImageData(0,0,640,640).data;
+        const display=live.branchCanvas.getContext('2d').getImageData(0,0,640,640).data;
+        let marked=0,outside=0;
+        for(let i=0;i<640*640;i++)if(display[i*4]===255&&display[i*4+1]===30&&display[i*4+2]===215){
+            marked++;if(!mask[i*4])outside++;
+        }
+        return {mode:live.viewMode,width:raw?.length,count:snapshot.rawSkeletonCount,
+            actual:raw?.reduce((sum,pixel)=>sum+pixel,0),marked,outside,
+            junctions:snapshot.rawJunctions?.length,
+            depthJunctions:snapshot.detection?.junctionComparison?.length,
+            junctionStatuses:snapshot.detection?.junctionComparison?.reduce((counts,item)=>{
+                counts[item.status]=(counts[item.status]||0)+1;return counts;
+            },{}),
+            junctionLabel:live.junctionNoDepthLabel.textContent,
+            depthLabel:live.junctionDepthLabel.textContent,
+            title:live.branchCanvas.parentElement.querySelector('.live-tile-title').textContent,
+            topKVisible:getComputedStyle(document.querySelector('[aria-label="Landing candidate top K"]').parentElement).display,
+            overlay:getComputedStyle(live.mainOverlay).visibility};
+    })()`);
+    assert.equal(djiRaw.mode,'raw');
+    assert.equal(djiRaw.width,320*320);
+    assert.equal(djiRaw.count,djiRaw.actual);
+    assert.ok(djiRaw.marked>0,'raw skeleton must be visible over RGB');
+    assert.equal(djiRaw.outside,0,'raw skeleton overlay must stay inside visible segmentation');
+    assert.ok(djiRaw.junctions>0,'the tree skeleton should expose 2D junctions');
+    assert.equal(djiRaw.depthJunctions,djiRaw.junctions,'depth comparison must classify the same raw junctions');
+    assert.equal(Object.values(djiRaw.junctionStatuses).reduce((sum,count)=>sum+count,0),djiRaw.junctions);
+    assert.match(djiRaw.junctionLabel,/2D only/);
+    assert.match(djiRaw.depthLabel,/With DA2/);
+    assert.match(djiRaw.title,/Raw skeleton/);
+    assert.equal(djiRaw.topKVisible,'none');
+    assert.equal(djiRaw.overlay,'hidden');
+    console.log(JSON.stringify({djiJunctions:{count:djiRaw.junctions,statuses:djiRaw.junctionStatuses}}));
+    await evaluate(`(() => {const tile=document.querySelector('.live-junction-tile');
+        tile.scrollIntoView({block:'center'});return tile.getBoundingClientRect().top;})()`);
+    const junctionShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile('/tmp/annotation_live_dji_junction_qa.png', Buffer.from(junctionShot.data, 'base64'));
+    await evaluate(`document.querySelector('[aria-label="Show junctions"]').click()`);
+    assert.equal(await evaluate(`scene.events.invoke('annotation.panel').liveView.showJunctions`),false);
+    await evaluate(`document.querySelector('.bbox-manager .bbox-preview-body').scrollTop=0`);
+    await evaluate(`(() => {const select=document.querySelector('[aria-label="Branch visualization"]');
+        select.value='candidates';select.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+
     const expanded = await evaluate(`(() => {
         const panel=document.querySelector('.bbox-manager');
         panel.style.width='620px';panel.style.height='800px';panel.classList.add('resized');
@@ -301,15 +522,48 @@ try {
         panel.querySelector('[aria-label="Maximize BBox Manager"]').click();
         const full=panel.getBoundingClientRect();
         const visibleMaximized=getComputedStyle(topK.parentElement).display;
+        const live=scene.events.invoke('annotation.panel').liveView;
+        const pcaControl=live.pcaAngleSlider.getBoundingClientRect();
+        const gravityControl=live.gravityAngleSlider.getBoundingClientRect();
+        const gravityLengthControl=live.gravityLengthSlider.getBoundingClientRect();
+        const gravityTrunkControl=live.gravityTrunkCheckbox.getBoundingClientRect();
+        live.pcaAngleSlider.value='35';live.pcaAngleSlider.dispatchEvent(new Event('input',{bubbles:true}));
+        const pcaMaximized={visible:pcaControl.width>0,angle:live.pcaMaxAngle,
+            merged:scene.events.invoke('annotation.liveSnapshot').pcaMergedCount,
+            gravityVisible:gravityControl.width>0,
+            gravityLengthVisible:gravityLengthControl.width>0,
+            gravityTrunkVisible:gravityTrunkControl.width>0,
+            gravityObjects:scene.events.invoke('annotation.liveSnapshot').pcaMergedObjects.length};
+        live.gravityAngleSlider.value='30';live.gravityAngleSlider.dispatchEvent(new Event('input',{bubbles:true}));
+        live.gravityLengthSlider.value='30';live.gravityLengthSlider.dispatchEvent(new Event('input',{bubbles:true}));
+        live.gravityTrunkCheckbox.checked=true;live.gravityTrunkCheckbox.dispatchEvent(new Event('change',{bubbles:true}));
+        const gravityMaximized={tolerance:live.gravityTolerance,
+            minLength:live.minGravityLength,excludeTrunks:live.excludeGravityTrunks,
+            selected:new Set(scene.events.invoke('annotation.liveSnapshot').gravityFilteredLabels).size-1};
+        live.gravityTrunkCheckbox.checked=false;live.gravityTrunkCheckbox.dispatchEvent(new Event('change',{bubbles:true}));
+        live.gravityLengthSlider.value='12';live.gravityLengthSlider.dispatchEvent(new Event('input',{bubbles:true}));
+        live.gravityAngleSlider.value='20';live.gravityAngleSlider.dispatchEvent(new Event('input',{bubbles:true}));
+        live.pcaAngleSlider.value='20';live.pcaAngleSlider.dispatchEvent(new Event('input',{bubbles:true}));
         const camera=document.getElementById('sensor-frame').getBoundingClientRect();
         return {before:[before.width,before.height],full:[full.width,full.height],panelLeft:full.left,camera:[camera.left,camera.right],
-            hiddenBefore,visibleMaximized,split:document.body.classList.contains('bbox-manager-camera-split')};
+            hiddenBefore,visibleMaximized,pcaMaximized,gravityMaximized,
+            split:document.body.classList.contains('bbox-manager-camera-split')};
     })()`);
     assert.ok(expanded.full[0] > expanded.before[0] && expanded.full[1] > expanded.before[1]);
     assert.ok(expanded.camera[1] < expanded.panelLeft, 'camera stays visible beside the expanded panel');
     assert.equal(expanded.split, true);
     assert.notEqual(expanded.hiddenBefore,'none','Top K must be available at the normal panel size');
     assert.notEqual(expanded.visibleMaximized,'none');
+    assert.equal(expanded.pcaMaximized.visible,true);
+    assert.equal(expanded.pcaMaximized.angle,35);
+    assert.ok(expanded.pcaMaximized.merged>0);
+    assert.equal(expanded.pcaMaximized.gravityVisible,true);
+    assert.equal(expanded.pcaMaximized.gravityLengthVisible,true);
+    assert.equal(expanded.pcaMaximized.gravityTrunkVisible,true);
+    assert.equal(expanded.pcaMaximized.gravityObjects,expanded.pcaMaximized.merged);
+    assert.equal(expanded.gravityMaximized.tolerance,30);
+    assert.equal(expanded.gravityMaximized.minLength,30);
+    assert.equal(expanded.gravityMaximized.excludeTrunks,true);
     await delay(300);
     const maxView = await evaluate(`(() => {
         const camera=scene.camera,rect=document.getElementById('canvas-container').getBoundingClientRect();
