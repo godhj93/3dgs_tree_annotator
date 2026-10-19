@@ -5,7 +5,7 @@ import ts from '../supersplat/node_modules/typescript/lib/typescript.js';
 
 const source = readFileSync(new URL('../supersplat/src/live-view-utils.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
-const { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32 } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32, numpyUint32 } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 
 test('640-square intrinsics preserve both full sensor fields of view', () => {
     const k = sensorIntrinsics();
@@ -41,4 +41,13 @@ test('NPY export retains shape and raw float32 values', () => {
     assert.deepEqual(Array.from(new Float32Array(encoded.buffer, 10 + headerSize)), Array.from(original));
     writeFileSync('/tmp/annotation_live_npy_test.npy', encoded);
     assert.throws(() => numpyFloat32(original, 4, 2), /shape mismatch/);
+});
+
+test('final segmentation NPY retains full uint32 object IDs', () => {
+    const ids = Uint32Array.of(0, 255, 65536, 4294967295);
+    const encoded = numpyUint32(ids, 2, 2);
+    const headerSize = new DataView(encoded.buffer).getUint16(8, true);
+    const header = new TextDecoder().decode(encoded.slice(10, 10 + headerSize));
+    assert.match(header, /'descr': '<u4'/);
+    assert.deepEqual(Array.from(new Uint32Array(encoded.buffer, 10 + headerSize)), Array.from(ids));
 });

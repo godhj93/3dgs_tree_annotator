@@ -124,7 +124,7 @@ explicitly select either convention.
   after merging; the right highlights those still passing. The sixth tile stays
   unfiltered for comparison. **Maximum deviation from 90°** (default 20°)
   applies at both stages and keeps reliable axes whose unsigned angle to the
-  scene's world-up/gravity axis lies in 70–90° by default. A value of 0°
+  scene's gravity axis lies in 70–90° by default. A value of 0°
   requires an exactly horizontal axis; 90° admits every reliable axis.
   **Minimum skeleton
   length** (default 12 px) measures each merged object's raw centerline in
@@ -133,6 +133,41 @@ explicitly select either convention.
   trunks by the existing detector. Changing the PCA merge angle or any seventh-
   tile filter updates the current frame without rerunning DA2. Length is not
   metric, and the angles use relative-depth pseudo-3D.
+- The eighth tile produces the **final landing candidate segmentation** from
+  the seventh tile's surviving objects. It rejects wide regions, weak 3D PCA
+  lines, inconsistent relative depth, and regions too low in the visible
+  annotation's gravity-aligned pseudo-3D height range. Adjust maximum apparent
+  width (default 24 image px), minimum PCA linearity (0.5), maximum relative
+  depth spread (0.3), minimum relative height (0.25), minimum non-green fraction
+  (0.25), and final Top K (3). **Reject green foliage** is on by default.
+  The final stage keeps the original DA2 junction-split link IDs even if PCA
+  merged them upstream, so a Y junction becomes separate branch instances.
+  It screens each link's non-green pixels with a pseudo-3D PCA axis and a
+  narrow projected cylinder corridor; green foliage pixels do not enter the
+  output mask. This is deliberately conservative where bark is hidden by leaves.
+  **Camera approach** prefers a center near the optical axis (default allowance
+  30°), an axis across rather than toward the camera (default maximum toward-
+  camera deviation 30°), and a nearly horizontal projection (default screen-
+  tilt allowance 30°). By default these angles affect ranking without hiding
+  every otherwise valid branch. Check **Require angles** to apply them as hard
+  limits; setting all three sliders to 90° allows every camera orientation.
+  They use the captured pose and camera-relative direction, not metric DA2
+  distance. The angles, ranking score, and strict-mode setting are saved.
+  The left image shows the seventh-stage input; the right overlays only the
+  selected instance regions on RGB. **View → Final segmentation** also shows
+  them in the fourth tile and, when **Show on main view** is checked, over the
+  main camera. IDs are stable within a frame and the mask never extends beyond
+  the visible annotation. These are geometric candidates; DA2 depth cannot
+  establish metric branch diameter, clearance, or load capacity.
+- The simulated camera pose is read from the current frame. To feed an IMU
+  gravity direction pointing **toward the ground** in camera coordinates, call
+  `scene.events.invoke('annotation.setImuGravity', {frame:'camera', vector:[x,y,z], captured_at_utc:'...'})`
+  with the synchronized sample. `frame:'world'` also accepts a world-frame
+  gravity vector. Camera-frame vectors are rotated into world coordinates using
+  the captured camera pose. Updating the vector recomputes the gravity and final
+  panels for the current frame without rerunning DA2. Pass `null` to use the
+  scene's up axis as a simulation fallback. The pose JSON records the gravity
+  vector and its source.
 - The landing-candidate mode shows branch instances and ranked landing
   candidates over the current RGB frame. A C++17 core uses
   RGB, the visible annotation mask, DA2 relative depth, camera intrinsics, and
@@ -172,8 +207,13 @@ explicitly select either convention.
 - `Save Current Set` becomes available after the current frame's depth and
   branch detection finish.
   Choose a folder to save `RGB/*.png`, `Mask/*.png`, `Depth/*.npy`,
-  `Depth/*_preview.png`, `Pose/*.json`, `Branches/*_instances.png`, and
-  `Branches/*.json`, all using one timestamped prefix. The instance PNG stores
+  `Depth/*_preview.png`, `Pose/*.json`, `Branches/*_instances.png`,
+  `Branches/*.json`, `Landing/*_ids.npy`, `Landing/*_preview.png`, and
+  `Landing/*.json`, all using one timestamped prefix. The Landing NPY is an
+  exact 640×640 `uint32` instance-ID mask (0 = background); its JSON records
+  filters, cylinder-fit metrics, rejection reasons, selected junction-split
+  link IDs, gravity source,
+  and the shared frame ID. The instance PNG stores
   branch IDs as equal RGB byte values (0 = background); the detection JSON has
   rank scores, endpoints, center pseudo-3D coordinates, junctions, estimated
   angle and class, active filters, excluded trunk IDs, horizontal branch IDs,

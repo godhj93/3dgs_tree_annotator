@@ -2,10 +2,12 @@ import { ADDRESS_CLAMP_TO_EDGE, FILTER_NEAREST, PIXELFORMAT_R8, Texture, Vec3 } 
 
 import { ElementType } from './element';
 import { Events } from './events';
-import { SENSOR_PROFILE, numpyFloat32, rowMajorMatrix, sensorIntrinsics, visibleMask } from './live-view-utils';
+import { SENSOR_PROFILE, numpyFloat32, numpyUint32, rowMajorMatrix, sensorIntrinsics, visibleMask } from './live-view-utils';
 import { Scene } from './scene';
 import { Splat } from './splat';
 import { State } from './splat-state';
+import { resolveGravityWorld, segmentFinalLanding } from './final-landing-analysis.mjs';
+import type { GravitySample, FinalLandingResult } from './final-landing-analysis.mjs';
 
 type AnnotationSource = {
     splat: Splat | null;
@@ -43,6 +45,10 @@ type LiveSnapshot = {
     gravityFilteredLabels?: Uint32Array;
     gravityFilteredOverlay?: HTMLCanvasElement;
     gravityFilterKey?: string;
+    finalLanding?: FinalLandingResult;
+    finalLandingKey?: string;
+    finalLandingOverlay?: HTMLCanvasElement;
+    finalLandingCpuMs?: number;
     comparisonCrop?: { x: number; y: number; size: number };
     detection?: BranchDetection;
 };
@@ -149,6 +155,17 @@ const instanceCanvas = (ids: Uint8Array, color: boolean) => {
     return pixelCanvas(pixels, 640, 640);
 };
 
+const finalLandingCanvas = (ids: Uint32Array) => {
+    const pixels = new Uint8ClampedArray(ids.length * 4);
+    for (let i = 0; i < ids.length; i++) {
+        if (!ids[i]) continue;
+        const color = branchPalette[((ids[i] - 1) % 254) + 1];
+        pixels.set(color, i * 4);
+        pixels[i * 4 + 3] = 220;
+    }
+    return pixelCanvas(pixels, 640, 640);
+};
+
 const principalAxisFromMoments = (pixels: number, sum: number[], outer: number[]) => {
     if (!pixels) return { axis: [1, 0, 0], linearity: 0, reliable: false };
     const center = sum.map(value => value / pixels);
@@ -212,7 +229,24 @@ class LiveView {
     gravityLengthSlider: HTMLInputElement;
     gravityLengthNumber: HTMLInputElement;
     gravityTrunkCheckbox: HTMLInputElement;
+    finalInputCanvas: HTMLCanvasElement;
+    finalOutputCanvas: HTMLCanvasElement;
+    finalInputLabel: HTMLDivElement;
+    finalOutputLabel: HTMLDivElement;
+    finalSummary: HTMLDivElement;
+    finalWidthSlider: HTMLInputElement;
+    finalLinearitySlider: HTMLInputElement;
+    finalDepthSlider: HTMLInputElement;
+    finalHeightSlider: HTMLInputElement;
+    finalWoodSlider: HTMLInputElement;
+    finalFoliageCheckbox: HTMLInputElement;
+    finalBearingSlider: HTMLInputElement;
+    finalEndOnSlider: HTMLInputElement;
+    finalImageTiltSlider: HTMLInputElement;
+    finalStrictCameraCheckbox: HTMLInputElement;
+    finalTopKInput: HTMLInputElement;
     detectorWorker: Worker | null = null;
+    imuGravity: GravitySample | null = null;
     excludeTrunk = false;
     horizontalAngle = 25;
     minBranchLength = 12;
@@ -225,7 +259,18 @@ class LiveView {
     gravityTolerance = 20;
     minGravityLength = 12;
     excludeGravityTrunks = false;
-    viewMode: 'raw' | 'candidates' = 'raw';
+    finalMaxWidthPx = 24;
+    finalMinLinearity = 0.5;
+    finalMaxDepthStdRelative = 0.3;
+    finalMinRelativeHeight = 0.25;
+    finalMinWoodyFraction = 0.25;
+    finalRejectFoliage = true;
+    finalMaxCenterBearing = 30;
+    finalMaxEndOn = 30;
+    finalMaxImageTilt = 30;
+    finalStrictCameraAngles = false;
+    finalTopK = 3;
+    viewMode: 'raw' | 'candidates' | 'final' = 'raw';
     showYellowSegmentation = true;
     mainOverlay: HTMLCanvasElement;
     saveButton: HTMLButtonElement;
@@ -271,6 +316,20 @@ class LiveView {
         events.function('annotation.membershipTexture', (splat: Splat) => (splat === this.memberSplat ? this.memberTexture : null));
         events.function('annotation.showSegmentationTint', () => this.showYellowSegmentation);
         events.function('annotation.liveSnapshot', () => this.last);
+        events.function('annotation.setImuGravity', (sample: GravitySample | null) => {
+            if (sample) resolveGravityWorld(sample, { world_up_axis: 'z',
+                camera_to_world: [[1, 0, 0], [0, 1, 0], [0, 0, 1]] });
+            this.imuGravity = sample ? { frame: sample.frame, vector: [...sample.vector] as [number, number, number],
+                captured_at_utc: sample.captured_at_utc } : null;
+            if (this.last) {
+                this.last.pose.gravity = resolveGravityWorld(this.imuGravity, this.last.pose);
+                this.last.pcaMergedAngle = undefined;
+                this.last.gravityMergedKey = undefined;
+                this.last.finalLandingKey = undefined;
+                this.drawPcaPanel(this.last);
+            }
+        });
+        events.function('annotation.getImuGravity', () => this.imuGravity);
         events.on('update', () => this.tick());
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) this.refresh();
@@ -380,7 +439,8 @@ class LiveView {
         const viewLabel = document.createElement('label');
         const viewSelect = document.createElement('select');
         viewSelect.setAttribute('aria-label', 'Branch visualization');
-        for (const [value, title] of [['raw', 'Raw skeleton'], ['candidates', 'Landing candidates']]) {
+        for (const [value, title] of [['raw', 'Raw skeleton'], ['candidates', 'Landing candidates'],
+            ['final', 'Final segmentation']]) {
             const option = document.createElement('option'); option.value = value; option.textContent = title;
             viewSelect.append(option);
         }
@@ -407,7 +467,7 @@ class LiveView {
         mainInput.setAttribute('aria-label', 'Show landing candidates on main view');
         mainInput.addEventListener('change', () => {
             this.showMainLanding = mainInput.checked;
-            if (this.last?.detection) this.drawMainLanding(this.last, this.branchView(this.last));
+            if (this.last?.detection) this.drawBranches(this.last);
             else this.hideMainLanding();
         });
         mainLabel.append(mainInput, 'Show on main view');
@@ -475,11 +535,12 @@ class LiveView {
         mainLabel.hidden = true;
         search.hidden = true;
         viewSelect.addEventListener('change', () => {
-            this.viewMode = viewSelect.value === 'candidates' ? 'candidates' : 'raw';
+            this.viewMode = viewSelect.value === 'candidates' ? 'candidates' :
+                (viewSelect.value === 'final' ? 'final' : 'raw');
             const raw = this.viewMode === 'raw';
-            topKLabel.hidden = raw;
+            topKLabel.hidden = this.viewMode !== 'candidates';
             mainLabel.hidden = raw;
-            search.hidden = raw;
+            search.hidden = this.viewMode !== 'candidates';
             if (this.last) this.drawBranches(this.last);
         });
         const grid = document.createElement('div');
@@ -660,6 +721,92 @@ class LiveView {
         this.gravitySummary.textContent = 'Individual PCA components and merged objects will be checked against gravity.';
         gravityTile.append(gravityTitle, gravityControls, gravityLengthControls, gravityGrid, this.gravitySummary);
         grid.append(gravityTile);
+        const finalTile = document.createElement('div');
+        finalTile.className = 'live-tile live-junction-tile live-final-tile';
+        const finalTitle = document.createElement('div'); finalTitle.className = 'live-tile-title';
+        finalTitle.textContent = 'Final landing candidate segmentation';
+        const finalControls = document.createElement('div'); finalControls.className = 'live-pca-controls';
+        const cameraControls = document.createElement('div'); cameraControls.className = 'live-pca-controls';
+        const cameraHeading = document.createElement('strong'); cameraHeading.textContent = 'Camera approach';
+        cameraControls.append(cameraHeading);
+        const strictCameraLabel = document.createElement('label'); strictCameraLabel.className = 'live-junction-toggle';
+        this.finalStrictCameraCheckbox = document.createElement('input'); this.finalStrictCameraCheckbox.type = 'checkbox';
+        this.finalStrictCameraCheckbox.checked = this.finalStrictCameraAngles;
+        this.finalStrictCameraCheckbox.setAttribute('aria-label', 'Require camera angles');
+        this.finalStrictCameraCheckbox.addEventListener('change', () => {
+            this.finalStrictCameraAngles = this.finalStrictCameraCheckbox.checked;
+            if (this.last) this.drawFinalPanel(this.last);
+        });
+        strictCameraLabel.append(this.finalStrictCameraCheckbox, 'Require angles');
+        cameraControls.append(strictCameraLabel);
+        const finalSetting = (name: string, aria: string, min: number, max: number, step: number,
+            initial: number, suffix: string, update: (value: number) => void,
+            container = finalControls) => {
+            const label = document.createElement('label'); label.textContent = name;
+            const slider = document.createElement('input'); slider.type = 'range';
+            slider.min = String(min); slider.max = String(max); slider.step = String(step); slider.value = String(initial);
+            slider.setAttribute('aria-label', aria);
+            const value = document.createElement('span'); value.textContent = `${initial}${suffix}`;
+            slider.addEventListener('input', () => {
+                update(Number(slider.value)); value.textContent = `${slider.value}${suffix}`;
+                if (this.last) this.drawFinalPanel(this.last);
+            });
+            container.append(label, slider, value);
+            return slider;
+        };
+        this.finalWidthSlider = finalSetting('Max apparent width', 'Maximum landing branch width', 4, 80, 2,
+            this.finalMaxWidthPx, 'px', value => { this.finalMaxWidthPx = value; });
+        this.finalLinearitySlider = finalSetting('Min 3D linearity', 'Minimum landing PCA linearity', 0, 1, 0.05,
+            this.finalMinLinearity, '', value => { this.finalMinLinearity = value; });
+        this.finalDepthSlider = finalSetting('Max relative depth spread', 'Maximum landing relative depth spread', 0.05, 1, 0.05,
+            this.finalMaxDepthStdRelative, '', value => { this.finalMaxDepthStdRelative = value; });
+        this.finalHeightSlider = finalSetting('Min relative height', 'Minimum landing relative height', 0, 0.5, 0.05,
+            this.finalMinRelativeHeight, '', value => { this.finalMinRelativeHeight = value; });
+        this.finalWoodSlider = finalSetting('Min non-green fraction', 'Minimum non-green branch fraction', 0, 1, 0.05,
+            this.finalMinWoodyFraction, '', value => { this.finalMinWoodyFraction = value; });
+        const foliageLabel = document.createElement('label'); foliageLabel.className = 'live-junction-toggle';
+        this.finalFoliageCheckbox = document.createElement('input'); this.finalFoliageCheckbox.type = 'checkbox';
+        this.finalFoliageCheckbox.checked = this.finalRejectFoliage;
+        this.finalFoliageCheckbox.setAttribute('aria-label', 'Reject green foliage');
+        this.finalFoliageCheckbox.addEventListener('change', () => {
+            this.finalRejectFoliage = this.finalFoliageCheckbox.checked;
+            if (this.last) this.drawFinalPanel(this.last);
+        });
+        foliageLabel.append(this.finalFoliageCheckbox, 'Reject green foliage'); finalControls.append(foliageLabel);
+        this.finalBearingSlider = finalSetting('Max center angle', 'Maximum camera center bearing angle', 0, 90, 5,
+            this.finalMaxCenterBearing, '°', value => { this.finalMaxCenterBearing = value; }, cameraControls);
+        this.finalEndOnSlider = finalSetting('Max axis toward camera', 'Maximum branch axis angle toward camera; 90 degrees allows any direction', 0, 90, 5,
+            this.finalMaxEndOn, '°', value => { this.finalMaxEndOn = value; }, cameraControls);
+        this.finalImageTiltSlider = finalSetting('Max screen tilt', 'Maximum branch tilt in camera image', 0, 90, 5,
+            this.finalMaxImageTilt, '°', value => { this.finalMaxImageTilt = value; }, cameraControls);
+        const finalTopKLabel = document.createElement('label'); finalTopKLabel.textContent = 'Top K';
+        this.finalTopKInput = document.createElement('input'); this.finalTopKInput.type = 'number';
+        this.finalTopKInput.min = '1'; this.finalTopKInput.max = '253'; this.finalTopKInput.step = '1';
+        this.finalTopKInput.value = String(this.finalTopK);
+        this.finalTopKInput.setAttribute('aria-label', 'Final landing top K');
+        this.finalTopKInput.addEventListener('input', () => {
+            const value = Number(this.finalTopKInput.value);
+            if (!Number.isInteger(value) || value < 1) return;
+            this.finalTopK = Math.min(253, value);
+            if (this.last) this.drawFinalPanel(this.last);
+        });
+        finalTopKLabel.append(this.finalTopKInput); finalControls.append(finalTopKLabel);
+        const finalGrid = document.createElement('div'); finalGrid.className = 'live-junction-grid';
+        const finalView = (caption: string) => {
+            const view = document.createElement('div'); view.className = 'live-junction-view';
+            const canvas = document.createElement('canvas'); canvas.width = canvas.height = 640;
+            const label = document.createElement('div'); label.className = 'live-junction-label';
+            label.textContent = caption; view.append(canvas, label); finalGrid.append(view);
+            return { canvas, label };
+        };
+        const finalInput = finalView('Gravity-filtered regions · waiting for depth');
+        const finalOutput = finalView('Final landing mask · waiting for depth');
+        this.finalInputCanvas = finalInput.canvas; this.finalInputLabel = finalInput.label;
+        this.finalOutputCanvas = finalOutput.canvas; this.finalOutputLabel = finalOutput.label;
+        this.finalSummary = document.createElement('div'); this.finalSummary.className = 'live-junction-summary';
+        this.finalSummary.textContent = 'Width, 3D linearity and depth spread will refine the gravity-filtered objects.';
+        finalTile.append(finalTitle, finalControls, cameraControls, finalGrid, this.finalSummary);
+        grid.append(finalTile);
         this.status = document.createElement('div');
         this.status.className = 'live-status';
         const save = document.createElement('div');
@@ -834,7 +981,7 @@ class LiveView {
             for (let i = 3; i < result.rgb.length; i += 4) result.rgb[i] = 255;
             const originalRgb = pixelCanvas(result.rgb, 963, 544);
             const mask = squareCanvas(pixelCanvas(visibleMask(result.membership), 963, 544), false);
-            const pose = {
+            const pose: any = {
                 frame_id: frameId,
                 captured_at_utc: new Date().toISOString(),
                 width: 640,
@@ -859,6 +1006,7 @@ class LiveView {
                     contribution_ratio_threshold: 0.5,
                     annotations: source.boxes }
             };
+            pose.gravity = resolveGravityWorld(this.imuGravity, pose);
             const snapshot: LiveSnapshot = { frameId, fingerprint: key, rgb: squareCanvas(originalRgb, true), mask, pose, depth: null };
             this.last = snapshot;
             this.hideMainLanding();
@@ -1113,6 +1261,39 @@ class LiveView {
         this.mainOverlay.style.visibility = view.landing.length ? 'visible' : 'hidden';
     }
 
+    drawMainFinal(snapshot: LiveSnapshot) {
+        if (!this.enabled || this.viewMode !== 'final' || !this.showMainLanding ||
+            snapshot !== this.last || snapshot.fingerprint !== this.viewFingerprint(this.getSource()) ||
+            !snapshot.finalLanding) {
+            this.hideMainLanding();
+            return;
+        }
+        const ctx = this.mainOverlay.getContext('2d');
+        ctx.clearRect(0, 0, this.mainOverlay.width, this.mainOverlay.height);
+        ctx.drawImage(snapshot.finalLandingOverlay, 0, 0, this.mainOverlay.width, this.mainOverlay.height);
+        this.drawFinalMarkers(ctx, snapshot);
+        this.mainOverlay.dataset.frameId = snapshot.frameId;
+        this.mainOverlay.style.visibility = snapshot.finalLanding.selected.length ? 'visible' : 'hidden';
+    }
+
+    drawFinalMarkers(ctx: CanvasRenderingContext2D, snapshot: LiveSnapshot, crop?: { x: number; y: number; size: number }) {
+        if (!snapshot.finalLanding) return;
+        const source = crop ?? { x: 0, y: 0, size: 640 };
+        for (const [rank, candidate] of snapshot.finalLanding.selected.entries()) {
+            const x = (candidate.center_px[0] - source.x) * ctx.canvas.width / source.size;
+            const y = (candidate.center_px[1] - source.y) * ctx.canvas.height / source.size;
+            if (x < 0 || y < 0 || x >= ctx.canvas.width || y >= ctx.canvas.height) continue;
+            const color = branchPalette[((candidate.id - 1) % 254) + 1];
+            ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2);
+            ctx.strokeStyle = '#071923'; ctx.lineWidth = 6; ctx.stroke();
+            ctx.strokeStyle = `rgb(${color.join(',')})`; ctx.lineWidth = 3; ctx.stroke();
+            ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+            const label = `#${rank + 1}`;
+            ctx.fillStyle = '#071923'; ctx.fillRect(x + 17, y - 12, 31, 24);
+            ctx.fillStyle = '#ffffff'; ctx.fillText(label, x + 21, y);
+        }
+    }
+
     comparisonCrop(snapshot: LiveSnapshot) {
         if (snapshot.comparisonCrop) return snapshot.comparisonCrop;
         let minX = 320, minY = 320, maxX = -1, maxY = -1;
@@ -1238,12 +1419,13 @@ class LiveView {
             for (let i = 0; i < 3; i++) group.sum[i] += object.moments.sum[i];
             for (let i = 0; i < 9; i++) group.outer[i] += object.moments.outer[i];
         }
-        const upAxis = snapshot.pose.world_up_axis === 'z' ? 2 : 1;
+        const gravity = snapshot.pose.gravity.vector as number[];
         const objects: GravityObject[] = [...pooled].map(([id, moments]) => {
             const fit = principalAxisFromMoments(moments.pixels, moments.sum, moments.outer);
             return { id, pixels: moments.pixels, axis: fit.axis, linearity: fit.linearity,
                 reliable: fit.reliable, angleToGravityDeg: fit.reliable ?
-                    Math.acos(Math.min(1, Math.abs(fit.axis[upAxis]))) * 180 / Math.PI : null,
+                    Math.acos(Math.min(1, Math.abs(fit.axis.reduce((sum, value, i) =>
+                        sum + value * gravity[i], 0)))) * 180 / Math.PI : null,
                 centerlineLengthPx: moments.centerlineLengthPx,
                 trunkCenterlineLengthPx: moments.trunkCenterlineLengthPx,
                 detectorCenterlineLengthPx: moments.detectorCenterlineLengthPx,
@@ -1323,13 +1505,15 @@ class LiveView {
             this.gravityInputLabel.textContent = 'Component gate · waiting for relative depth';
             this.gravityFilteredLabel.textContent = 'Near-horizontal · waiting for relative depth';
             this.gravitySummary.textContent = 'Individual PCA components and merged objects will be checked against gravity.';
+            this.drawFinalPanel(snapshot);
             return;
         }
-        const mergeKey = `${this.pcaMaxAngle}:${this.gravityTolerance}`;
+        const gravity = snapshot.pose.gravity.vector as number[];
+        const mergeKey = `${this.pcaMaxAngle}:${this.gravityTolerance}:${gravity.join(',')}`;
         if (snapshot.gravityMergedKey !== mergeKey || !snapshot.gravityMergedLabels) {
-            const upAxis = snapshot.pose.world_up_axis === 'z' ? 2 : 1;
             const eligible = new Set(snapshot.detection.pcaObjects.filter(object => object.reliable &&
-                90 - Math.acos(Math.min(1, Math.abs(object.axis[upAxis]))) * 180 / Math.PI <= this.gravityTolerance)
+                90 - Math.acos(Math.min(1, Math.abs(object.axis.reduce((sum, value, i) =>
+                    sum + value * gravity[i], 0)))) * 180 / Math.PI <= this.gravityTolerance)
                 .map(object => object.id));
             const merged = this.buildPcaGroups(snapshot, eligible);
             snapshot.gravityMergedLabels = merged.labels;
@@ -1365,7 +1549,90 @@ class LiveView {
         this.gravityInputLabel.textContent = `Component gate · ${snapshot.gravityEligibleCount} / ${snapshot.detection.pcaObjects.length} PCA axes kept · ${objects.length} merged objects`;
         this.gravityFilteredLabel.textContent = `Near-horizontal · ${accepted.size} / ${objects.length} objects kept`;
         const trunkCount = objects.filter(object => object.isTrunk).length;
-        this.gravitySummary.textContent = `First keep reliable DA2 PCA components ${90 - this.gravityTolerance}–90° from gravity; merge those survivors, then check each merged axis against the same angle. Keep raw-skeleton centerlines ≥${this.minGravityLength} px. Trunk exclusion ${this.excludeGravityTrunks ? 'on' : 'off'} (${trunkCount} trunk-like objects); world ${snapshot.pose.world_up_axis?.toUpperCase() ?? 'Y'} is up. Length is image pixels, not meters; DA2 geometry remains relative pseudo-3D.`;
+        this.gravitySummary.textContent = `First keep reliable DA2 PCA components ${90 - this.gravityTolerance}–90° from gravity; merge those survivors, then check each merged axis against the same angle. Keep raw-skeleton centerlines ≥${this.minGravityLength} px. Trunk exclusion ${this.excludeGravityTrunks ? 'on' : 'off'} (${trunkCount} trunk-like objects); gravity source: ${snapshot.pose.gravity.source === 'imu' ? 'IMU' : 'scene up'}. Length is image pixels, not meters; DA2 geometry remains relative pseudo-3D.`;
+        this.drawFinalPanel(snapshot);
+    }
+
+    drawFinalPanel(snapshot: LiveSnapshot) {
+        const input = this.finalInputCanvas.getContext('2d');
+        const output = this.finalOutputCanvas.getContext('2d');
+        if (!snapshot.gravityFilteredLabels || !snapshot.depth || !snapshot.gravityMergedObjects) {
+            for (const ctx of [input, output]) {
+                ctx.clearRect(0, 0, 640, 640);
+                ctx.globalAlpha = 0.35; ctx.drawImage(snapshot.rgb, 0, 0); ctx.globalAlpha = 1;
+            }
+            this.finalInputLabel.textContent = 'Gravity-filtered regions · waiting for relative depth';
+            this.finalOutputLabel.textContent = 'Final landing mask · waiting for relative depth';
+            this.finalSummary.textContent = 'Width, 3D linearity and depth spread will refine the gravity-filtered objects.';
+            return;
+        }
+        const key = `${snapshot.gravityFilterKey}:${this.finalMaxWidthPx}:${this.finalMinLinearity}:` +
+            `${this.finalMaxDepthStdRelative}:${this.finalMinRelativeHeight}:${this.finalMinWoodyFraction}:` +
+            `${this.finalRejectFoliage}:${this.finalMaxCenterBearing}:${this.finalMaxEndOn}:` +
+            `${this.finalMaxImageTilt}:${this.finalStrictCameraAngles}:${this.finalTopK}`;
+        if (snapshot.finalLandingKey !== key || !snapshot.finalLanding) {
+            const started = performance.now();
+            const maskRgba = snapshot.mask.getContext('2d').getImageData(0, 0, 640, 640).data;
+            const mask = new Uint8Array(640 * 640);
+            for (let i = 0; i < mask.length; i++) mask[i] = maskRgba[i * 4];
+            const rgb = new Uint8Array(snapshot.rgb.getContext('2d').getImageData(0, 0, 640, 640).data);
+            snapshot.finalLanding = segmentFinalLanding({ labels: snapshot.gravityFilteredLabels,
+                sourceLabels: snapshot.detection.depthLinkLabels,
+                objects: snapshot.gravityMergedObjects, sourceObjects: snapshot.detection.pcaObjects,
+                mask, depth: snapshot.depth, rgb, pose: snapshot.pose,
+                settings: { minLengthPx: this.minGravityLength, minLinearity: this.finalMinLinearity,
+                    maxWidthPx: this.finalMaxWidthPx, maxDepthStdRelative: this.finalMaxDepthStdRelative,
+                    minRelativeHeight: this.finalMinRelativeHeight, minWoodyFraction: this.finalMinWoodyFraction,
+                    rejectFoliage: this.finalRejectFoliage,
+                    maxAngleFromHorizontalDeg: this.gravityTolerance,
+                    maxCenterBearingDeg: this.finalMaxCenterBearing,
+                    maxEndOnDeviationDeg: this.finalMaxEndOn,
+                    maxImageTiltDeg: this.finalMaxImageTilt,
+                    strictCameraAngles: this.finalStrictCameraAngles,
+                    excludeTrunks: this.excludeGravityTrunks, topK: this.finalTopK } });
+            snapshot.finalLandingOverlay = finalLandingCanvas(snapshot.finalLanding.ids);
+            snapshot.finalLandingCpuMs = performance.now() - started;
+            snapshot.finalLandingKey = key;
+        }
+        input.clearRect(0, 0, 640, 640);
+        this.drawComparisonLayer(input, snapshot.rgb, snapshot);
+        this.drawComparisonLayer(input, snapshot.gravityFilteredOverlay, snapshot);
+        output.clearRect(0, 0, 640, 640);
+        output.globalAlpha = 0.45; this.drawComparisonLayer(output, snapshot.rgb, snapshot); output.globalAlpha = 1;
+        this.drawComparisonLayer(output, snapshot.finalLandingOverlay, snapshot);
+        this.drawFinalMarkers(output, snapshot, this.comparisonCrop(snapshot));
+        const result = snapshot.finalLanding;
+        this.finalInputLabel.textContent = `Gravity filtered · ${snapshot.gravityMergedObjects.length} merged objects · zoomed`;
+        this.finalOutputLabel.textContent = `Final mask · ${result.selected.length} / ${result.eligible.length} eligible shown · zoomed`;
+        const ranks = result.selected.map((item, index) =>
+            `#${index + 1} ID ${item.id} · center ${item.center_bearing_deg.toFixed(0)}° · ` +
+            `axis toward ${item.end_on_deviation_deg.toFixed(0)}° · ` +
+            `screen ${item.image_tilt_deg.toFixed(0)}° · view fit ${Math.round(item.view_score * 100)}%`).join(' | ');
+        const rejected = { height: 0, width: 0, linearity: 0, depth: 0, foliage: 0, cylinder: 0,
+            offCenter: 0, endOn: 0, screenTilt: 0 };
+        for (const candidate of result.results) {
+            if (candidate.reasons.includes('low_height')) rejected.height++;
+            if (candidate.reasons.includes('wide')) rejected.width++;
+            if (candidate.reasons.includes('low_linearity')) rejected.linearity++;
+            if (candidate.reasons.includes('depth_spread')) rejected.depth++;
+            if (candidate.reasons.includes('foliage')) rejected.foliage++;
+            if (candidate.reasons.includes('not_cylindrical')) rejected.cylinder++;
+            if (candidate.reasons.includes('off_center')) rejected.offCenter++;
+            if (candidate.reasons.includes('end_on')) rejected.endOn++;
+            if (candidate.reasons.includes('screen_tilt')) rejected.screenTilt++;
+        }
+        this.finalSummary.textContent = `One DA2 junction-split link per ID; green foliage ${this.finalRejectFoliage ? 'removed' : 'kept'}. ` +
+            `Wood-only PCA linearity ≥${this.finalMinLinearity}, projected cylinder width ≤${this.finalMaxWidthPx}px, ` +
+            `relative depth spread ≤${this.finalMaxDepthStdRelative}, relative height ≥${this.finalMinRelativeHeight}. ` +
+            `Camera ${this.finalStrictCameraAngles ? 'required' : 'ranking only'}: center ≤${this.finalMaxCenterBearing}°, ` +
+            `axis toward camera ≤${this.finalMaxEndOn}°, screen tilt ≤${this.finalMaxImageTilt}°. ` +
+            `Rejected: foliage ${rejected.foliage}, non-cylinder ${rejected.cylinder}, low height ${rejected.height}, ` +
+            `wide ${rejected.width}, non-linear ${rejected.linearity}, depth ${rejected.depth}, ` +
+            `off-center ${rejected.offCenter}, end-on ${rejected.endOn}, screen tilt ${rejected.screenTilt}. ` +
+            `${ranks || 'No candidate passes all filters.'} ` +
+            `Final CPU ${snapshot.finalLandingCpuMs.toFixed(1)}ms. ` +
+            `DA2 depth and width are not metric; verify physical clearance and load capacity separately.`;
+        if (this.viewMode === 'final') this.drawBranches(snapshot);
     }
 
     drawJunctionComparison(snapshot: LiveSnapshot) {
@@ -1435,6 +1702,32 @@ class LiveView {
             this.hideMainLanding();
             return;
         }
+        if (this.viewMode === 'final') {
+            this.branchCanvas.parentElement.querySelector('.live-tile-title').textContent = 'Final landing segmentation · top K';
+            const ctx = this.branchCanvas.getContext('2d');
+            ctx.clearRect(0, 0, 640, 640);
+            ctx.globalAlpha = 0.35; ctx.drawImage(snapshot.rgb, 0, 0); ctx.globalAlpha = 1;
+            if (snapshot.finalLanding) {
+                ctx.drawImage(snapshot.finalLandingOverlay, 0, 0);
+                this.drawFinalMarkers(ctx, snapshot);
+                this.branchList.replaceChildren();
+                const heading = document.createElement('div');
+                heading.textContent = `${snapshot.finalLanding.selected.length} shown / ${snapshot.finalLanding.eligible.length} eligible · gravity: ${snapshot.pose.gravity.source === 'imu' ? 'IMU' : 'scene fallback'}`;
+                this.branchList.append(heading);
+                for (const [index, candidate] of snapshot.finalLanding.selected.entries()) {
+                    const line = document.createElement('div');
+                    line.textContent = `Rank ${index + 1} · ID ${candidate.id} · center ${candidate.center_bearing_deg.toFixed(0)}° · ` +
+                        `axis toward ${candidate.end_on_deviation_deg.toFixed(0)}° · ` +
+                        `screen tilt ${candidate.image_tilt_deg.toFixed(0)}° · view fit ${Math.round(candidate.view_score * 100)}%`;
+                    this.branchList.append(line);
+                }
+                this.drawMainFinal(snapshot);
+            } else {
+                this.branchList.textContent = 'Waiting for gravity, depth and final segmentation…';
+                this.hideMainLanding();
+            }
+            return;
+        }
         this.branchCanvas.parentElement.querySelector('.live-tile-title').textContent = 'Landing candidates · top K';
         if (!snapshot.detection) {
             this.branchCanvas.getContext('2d').drawImage(snapshot.rgb, 0, 0);
@@ -1500,15 +1793,18 @@ class LiveView {
         try {
             const folder = this.getOutputFolder() ?? await this.chooseOutputFolder();
             const prefix = `${snapshot.frameId}_save_${Date.now()}`;
-            const groupNames = ['RGB', 'Mask', 'Depth', 'Pose', 'Branches'];
-            const groups: any[] = folder ? await Promise.all(groupNames.map(name => folder.getDirectoryHandle(name, { create: true }))) : [null, null, null, null, null];
+            const groupNames = ['RGB', 'Mask', 'Depth', 'Pose', 'Branches', 'Landing'];
+            const groups: any[] = folder ? await Promise.all(groupNames.map(name => folder.getDirectoryHandle(name, { create: true }))) : [null, null, null, null, null, null];
             const names = { rgb: `RGB/${prefix}.png`,
                 mask: `Mask/${prefix}.png`,
                 depth: `Depth/${prefix}.npy`,
                 depth_preview: `Depth/${prefix}_preview.png`,
                 pose: `Pose/${prefix}.json`,
                 branch_instances: `Branches/${prefix}_instances.png`,
-                branch_detection: `Branches/${prefix}.json` };
+                branch_detection: `Branches/${prefix}.json`,
+                landing_ids: `Landing/${prefix}_ids.npy`,
+                landing_preview: `Landing/${prefix}_preview.png`,
+                landing_analysis: `Landing/${prefix}.json` };
             if (!folder) {
                 Object.keys(names).forEach((key) => {
                     names[key as keyof typeof names] = names[key as keyof typeof names].replace('/', '_');
@@ -1516,6 +1812,8 @@ class LiveView {
             }
             const pose = { ...snapshot.pose, files: names };
             const view = this.branchView(snapshot);
+            this.drawFinalPanel(snapshot);
+            const final = snapshot.finalLanding;
             const detection = { frame_id: snapshot.frameId, captured_at_utc: snapshot.pose.captured_at_utc,
                 geometry_units: snapshot.detection.geometry_units, ranking: snapshot.detection.ranking,
                 cpu_ms: snapshot.detection.cpu_ms, width: 640, height: 640,
@@ -1530,6 +1828,31 @@ class LiveView {
                 landing_candidate_ids: view.landing.map(branch => branch.id),
                 branches: view.branches, junctions_px: snapshot.detection.junctions,
                 files: names };
+            const landing = { frame_id: snapshot.frameId, captured_at_utc: snapshot.pose.captured_at_utc,
+                width: 640, height: 640, id_map: 'uint32 NPY; zero is background; nonzero values are junction-split DA2 link IDs',
+                depth_units: snapshot.depthInfo.units, gravity: snapshot.pose.gravity,
+                final_cpu_ms: snapshot.finalLandingCpuMs,
+                filters: { component_and_merged_max_gravity_deviation_deg: this.gravityTolerance,
+                    merge_max_axis_angle_deg: this.pcaMaxAngle, min_centerline_length_px: this.minGravityLength,
+                    exclude_trunks: this.excludeGravityTrunks, min_linearity: this.finalMinLinearity,
+                    max_apparent_width_px: this.finalMaxWidthPx,
+                    max_relative_depth_std: this.finalMaxDepthStdRelative,
+                    min_relative_height: this.finalMinRelativeHeight,
+                    reject_green_foliage: this.finalRejectFoliage,
+                    min_non_green_fraction: this.finalMinWoodyFraction,
+                    require_camera_angles: this.finalStrictCameraAngles,
+                    max_camera_center_bearing_deg: this.finalMaxCenterBearing,
+                    max_camera_end_on_deviation_deg: this.finalMaxEndOn,
+                    min_camera_side_on_deg: 90 - this.finalMaxEndOn,
+                    max_camera_image_tilt_deg: this.finalMaxImageTilt,
+                    top_k: this.finalTopK },
+                selected_ids: final.selected.map(candidate => candidate.id),
+                candidates: final.results, files: names };
+            const landingPreview = document.createElement('canvas');
+            landingPreview.width = landingPreview.height = 640;
+            const landingCtx = landingPreview.getContext('2d');
+            landingCtx.drawImage(snapshot.rgb, 0, 0);
+            landingCtx.drawImage(snapshot.finalLandingOverlay, 0, 0);
             const files = [
                 { name: `${prefix}.png`, group: 0, blob: await pngBlob(snapshot.rgb) },
                 { name: `${prefix}.png`, group: 1, blob: await pngBlob(snapshot.mask) },
@@ -1537,13 +1860,16 @@ class LiveView {
                 { name: `${prefix}_preview.png`, group: 2, blob: await pngBlob(depthCanvas(snapshot.depth)) },
                 { name: `${prefix}.json`, group: 3, blob: new Blob([JSON.stringify(pose, null, 2)], { type: 'application/json' }) },
                 { name: `${prefix}_instances.png`, group: 4, blob: await pngBlob(instanceCanvas(view.instanceMask, false)) },
-                { name: `${prefix}.json`, group: 4, blob: new Blob([JSON.stringify(detection, null, 2)], { type: 'application/json' }) }
+                { name: `${prefix}.json`, group: 4, blob: new Blob([JSON.stringify(detection, null, 2)], { type: 'application/json' }) },
+                { name: `${prefix}_ids.npy`, group: 5, blob: new Blob([numpyUint32(final.ids, 640, 640).buffer], { type: 'application/octet-stream' }) },
+                { name: `${prefix}_preview.png`, group: 5, blob: await pngBlob(landingPreview) },
+                { name: `${prefix}.json`, group: 5, blob: new Blob([JSON.stringify(landing, null, 2)], { type: 'application/json' }) }
             ];
             for (const file of files) {
                 const name = folder ? file.name : `${groupNames[file.group]}_${file.name}`;
                 await this.writeFile(name, file.blob, groups[file.group]);
             }
-            this.message('ready', `Saved synchronized 640×640 RGB, mask, raw relative depth, pose and branches · ${prefix}`);
+            this.message('ready', `Saved synchronized 640×640 RGB, mask, depth, pose, branches and final landing segmentation · ${prefix}`);
         } finally {
             this.saving = false;
             this.saveButton.disabled = !this.enabled || !this.last?.detection || this.last.fingerprint !== this.viewFingerprint(this.getSource());

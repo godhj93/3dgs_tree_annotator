@@ -1,0 +1,32 @@
+export type GravitySample = { frame: 'camera' | 'world'; vector: [number, number, number]; captured_at_utc?: string };
+export type GravityResult = { vector: number[]; source: 'scene_up' | 'imu'; frame?: 'camera' | 'world'; captured_at_utc?: string | null };
+export type FinalLandingSettings = { minLengthPx: number; minLinearity: number; maxWidthPx: number;
+    maxDepthStdRelative: number; minRelativeHeight: number; minWoodyFraction?: number;
+    rejectFoliage?: boolean; maxAngleFromHorizontalDeg?: number;
+    maxCenterBearingDeg?: number; maxEndOnDeviationDeg?: number; maxImageTiltDeg?: number;
+    strictCameraAngles?: boolean;
+    excludeTrunks: boolean; topK: number };
+export type FinalLandingObject = { id: number; centerlineLengthPx: number; reliable: boolean;
+    linearity: number; angleToGravityDeg?: number | null; isTrunk?: boolean;
+    trunkCenterlineLengthPx?: number };
+export type FinalLandingCandidate = { id: number; merged_id: number; area_px: number;
+    woody_area_px: number; wood_fraction: number; centerline_length_px: number;
+    fitted_length_px: number; apparent_width_px: number; cylinder_width_px: number;
+    cylinder_inlier_fraction: number; longitudinal_coverage: number;
+    longest_empty_axial_bins: number; projected_linearity: number;
+    linearity: number; angle_from_horizontal_deg: number;
+    center_px: number[]; center_camera_pseudo3d: number[]; center_bearing_deg: number;
+    side_on_deg: number; end_on_deviation_deg: number;
+    image_tilt_deg: number; view_score: number;
+    relative_depth_std: number; relative_height: number; mean_relative_depth: number; mean_rgb: number[];
+    is_trunk: boolean; score: number; reasons: string[] };
+export type FinalLandingResult = { ids: Uint32Array; results: FinalLandingCandidate[];
+    eligible: FinalLandingCandidate[]; selected: FinalLandingCandidate[];
+    depthRange: number; heightLow: number; heightHigh: number };
+export function resolveGravityWorld(sample: GravitySample | null, pose: {
+    world_up_axis: string; camera_to_world: number[][] }): GravityResult;
+export function segmentFinalLanding(input: { labels: Uint32Array; sourceLabels?: Uint32Array;
+    objects: FinalLandingObject[]; sourceObjects?: FinalLandingObject[];
+    mask: Uint8Array; depth: Float32Array; rgb: Uint8Array; pose: {
+        camera_to_world: number[][]; intrinsics: number[][]; gravity: GravityResult };
+    settings: FinalLandingSettings }): FinalLandingResult;

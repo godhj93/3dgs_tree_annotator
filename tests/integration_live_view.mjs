@@ -228,7 +228,7 @@ try {
         return true;
     })()`);
     await evaluate(`window.scene.events.invoke('annotation.panel').liveView.save()`);
-    await waitFor('window._qaFiles.length === 7');
+    await waitFor('window._qaFiles.length === 10');
     const files = await evaluate('window._qaFiles');
     for (const file of files) {
         const filename = path.join('/tmp/annotation_live_export_qa', file.path);
@@ -457,6 +457,90 @@ try {
     assert.match(gravity.inputLabel,/Component gate/);
     assert.match(gravity.outputLabel,/Near-horizontal/);
     console.log(JSON.stringify({djiGravity:gravity}));
+    const final = await evaluate(`(() => {
+        const live=scene.events.invoke('annotation.panel').liveView,s=scene.events.invoke('annotation.liveSnapshot');
+        const original=s.finalLanding;
+        const mask=s.mask.getContext('2d').getImageData(0,0,640,640).data;
+        const rgb=s.rgb.getContext('2d').getImageData(0,0,640,640).data;
+        let selectedPixels=0,outside=0,wrongSource=0,greenSelected=0;
+        for(let i=0;i<original.ids.length;i++)if(original.ids[i]){
+            selectedPixels++;
+            if(!mask[i*4])outside++;
+            const small=(Math.floor(i/640)>>1)*320+((i%640)>>1);
+            const source=s.detection.depthLinkLabels[small];
+            if(source!==original.ids[i])wrongSource++;
+            if(!s.gravityFilteredLabels[small])wrongSource++;
+            const r=rgb[i*4],g=rgb[i*4+1],b=rgb[i*4+2];
+            if(g>=35&&g-r>=10&&g-b>=8&&g>r*1.1&&g>b*1.08)greenSelected++;
+        }
+        const before={frame:s.frameId,selected:original.selected.map(c=>c.id),eligible:original.eligible.length,
+            selectedPixels,outside,wrongSource,greenSelected,
+            rejected:original.results.filter(c=>c.reasons.length).length,
+            lowHeightRejected:original.results.filter(c=>c.reasons.includes('low_height')).length,
+            cpuMs:s.finalLandingCpuMs,
+            gravity:s.pose.gravity};
+        const bearing=live.finalBearingSlider,endOn=live.finalEndOnSlider,tilt=live.finalImageTiltSlider;
+        const strict=live.finalStrictCameraCheckbox;
+        strict.checked=true;strict.dispatchEvent(new Event('change',{bubbles:true}));
+        const strictSelected=s.finalLanding.selected.map(c=>c.id);
+        const screenTiltRejected=s.finalLanding.results.filter(c=>c.reasons.includes('screen_tilt')).length;
+        bearing.value='90';bearing.dispatchEvent(new Event('input',{bubbles:true}));
+        endOn.value='90';endOn.dispatchEvent(new Event('input',{bubbles:true}));
+        tilt.value='90';tilt.dispatchEvent(new Event('input',{bubbles:true}));
+        const allNinety=s.finalLanding.selected.map(c=>c.id);
+        bearing.value='30';bearing.dispatchEvent(new Event('input',{bubbles:true}));
+        endOn.value='30';endOn.dispatchEvent(new Event('input',{bubbles:true}));
+        tilt.value='30';tilt.dispatchEvent(new Event('input',{bubbles:true}));
+        strict.checked=false;strict.dispatchEvent(new Event('change',{bubbles:true}));
+        const width=live.finalWidthSlider;width.value='4';width.dispatchEvent(new Event('input',{bubbles:true}));
+        const narrow=s.finalLanding.selected.length;
+        width.value='24';width.dispatchEvent(new Event('input',{bubbles:true}));
+        const topK=live.finalTopKInput;topK.value='1';topK.dispatchEvent(new Event('input',{bubbles:true}));
+        const topOne=s.finalLanding.selected.length;
+        topK.value='3';topK.dispatchEvent(new Event('input',{bubbles:true}));
+        const pose=s.pose.camera_to_world;
+        const expected=[-pose[0][1],-pose[1][1],-pose[2][1]];
+        scene.events.invoke('annotation.setImuGravity',{frame:'camera',vector:[0,-1,0]});
+        const imu={...s.pose.gravity};
+        scene.events.invoke('annotation.setImuGravity',null);
+        return {...before,strictSelected,screenTiltRejected,allNinety,
+            narrow,topOne,restored:s.finalLanding.selected.map(c=>c.id),imu,expected,
+            sameFrame:s===scene.events.invoke('annotation.liveSnapshot')};
+    })()`);
+    assert.equal(final.gravity.source,'scene_up');
+    assert.equal(final.outside,0);
+    assert.equal(final.wrongSource,0);
+    assert.equal(final.greenSelected,0);
+    assert.ok(final.selectedPixels>0);
+    assert.ok(final.strictSelected.length<final.selected.length);
+    assert.ok(final.allNinety.length>=final.selected.length);
+    assert.ok(final.screenTiltRejected>0);
+    assert.ok(final.lowHeightRejected>0);
+    assert.ok(Number.isFinite(final.cpuMs));
+    assert.ok(final.narrow<=final.selected.length);
+    assert.ok(final.topOne<=1);
+    assert.deepEqual(final.restored,final.selected);
+    assert.equal(final.imu.source,'imu');
+    assert.ok(final.imu.vector.every((value,i)=>Math.abs(value-final.expected[i])<1e-6));
+    assert.equal(final.sameFrame,true);
+    console.log(JSON.stringify({djiFinal:final}));
+    const finalMain = await evaluate(`(() => {
+        const view=document.querySelector('[aria-label="Branch visualization"]');
+        view.value='final';view.dispatchEvent(new Event('change',{bubbles:true}));
+        const overlay=document.querySelector('#landing-overlay');
+        const result={title:scene.events.invoke('annotation.panel').liveView.branchCanvas.parentElement.querySelector('.live-tile-title').textContent,
+            overlay:getComputedStyle(overlay).visibility,
+            frame:overlay.dataset.frameId,
+            selected:scene.events.invoke('annotation.liveSnapshot').finalLanding.selected.length};
+        view.value='raw';view.dispatchEvent(new Event('change',{bubbles:true}));
+        return result;
+    })()`);
+    assert.match(finalMain.title,/Final landing segmentation/);
+    assert.equal(finalMain.overlay,finalMain.selected?'visible':'hidden');
+    assert.equal(finalMain.frame,final.frame);
+    await evaluate(`document.querySelector('.live-final-tile').scrollIntoView({block:'center'})`);
+    const finalShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+    await writeFile('/tmp/annotation_live_dji_final_qa.png', Buffer.from(finalShot.data, 'base64'));
     await evaluate(`document.querySelector('.live-gravity-tile').scrollIntoView({block:'center'})`);
     const gravityShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
     await writeFile('/tmp/annotation_live_dji_gravity_qa.png', Buffer.from(gravityShot.data, 'base64'));
@@ -703,7 +787,7 @@ try {
         return true;
     })()`);
     await evaluate(`window.scene.events.invoke('annotation.panel').liveView.save()`);
-    await waitFor('window._qaFiles.length === 7');
+    await waitFor('window._qaFiles.length === 10');
     const djiFiles = await evaluate('window._qaFiles');
     const detectionFile = djiFiles.find(file => file.path.startsWith('Branches/') && file.path.endsWith('.json'));
     const savedDetection = JSON.parse(Buffer.from(detectionFile.base64,'base64').toString('utf8'));
@@ -716,6 +800,28 @@ try {
     assert.deepEqual(savedDetection.excluded_trunk_ids,filtered.excluded);
     assert.deepEqual(savedDetection.horizontal_branch_ids,filtered.horizontal);
     assert.deepEqual(savedDetection.landing_candidate_ids,filtered.landing);
+    const landingFile = djiFiles.find(file => file.path.startsWith('Landing/') && file.path.endsWith('.json'));
+    const savedLanding = JSON.parse(Buffer.from(landingFile.base64,'base64').toString('utf8'));
+    const landingIdsFile = djiFiles.find(file => file.path.startsWith('Landing/') && file.path.endsWith('_ids.npy'));
+    const landingIdsBytes = Buffer.from(landingIdsFile.base64,'base64');
+    const landingHeaderLength = landingIdsBytes.readUInt16LE(8);
+    const landingHeader = landingIdsBytes.subarray(10,10+landingHeaderLength).toString('utf8');
+    assert.match(landingHeader, /'descr': '<u4'/);
+    assert.match(landingHeader, /'shape': \(640, 640\)/);
+    assert.equal(landingIdsBytes.length,10+landingHeaderLength+640*640*4);
+    assert.equal(savedLanding.frame_id,filtered.frame);
+    assert.equal(savedLanding.gravity.source,'scene_up');
+    assert.equal(savedLanding.filters.require_camera_angles,false);
+    assert.equal(savedLanding.filters.max_camera_center_bearing_deg,30);
+    assert.equal(savedLanding.filters.max_camera_end_on_deviation_deg,30);
+    assert.equal(savedLanding.filters.min_camera_side_on_deg,60);
+    assert.equal(savedLanding.filters.max_camera_image_tilt_deg,30);
+    assert.ok(savedLanding.candidates.some(candidate =>
+        Number.isFinite(candidate.center_bearing_deg) &&
+        Number.isFinite(candidate.side_on_deg) &&
+        Number.isFinite(candidate.image_tilt_deg)));
+    assert.deepEqual(savedLanding.selected_ids,
+        await evaluate(`scene.events.invoke('annotation.liveSnapshot').finalLanding.selected.map(c=>c.id)`));
     for (const file of djiFiles) {
         const filename = path.join('/tmp/annotation_live_dji_export_qa', file.path);
         await mkdir(path.dirname(filename), { recursive: true });

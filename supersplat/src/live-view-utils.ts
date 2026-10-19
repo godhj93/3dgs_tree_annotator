@@ -51,4 +51,18 @@ const numpyFloat32 = (depth: Float32Array, width: number, height: number) => {
     return result;
 };
 
-export { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32 };
+const numpyUint32 = (ids: Uint32Array, width: number, height: number) => {
+    if (ids.length !== width * height) throw new Error('Segmentation ID shape mismatch');
+    const description = `{'descr': '<u4', 'fortran_order': False, 'shape': (${height}, ${width}), }`;
+    const padding = (64 - ((10 + description.length + 1) % 64)) % 64;
+    const header = new TextEncoder().encode(`${description}${' '.repeat(padding)}\n`);
+    const result = new Uint8Array(10 + header.length + ids.length * 4);
+    result.set([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59, 1, 0]);
+    const view = new DataView(result.buffer);
+    view.setUint16(8, header.length, true);
+    result.set(header, 10);
+    for (let i = 0; i < ids.length; i++) view.setUint32(10 + header.length + i * 4, ids[i], true);
+    return result;
+};
+
+export { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32, numpyUint32 };
