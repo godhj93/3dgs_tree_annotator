@@ -15,6 +15,7 @@ float smallDepth[N];
 uint32_t queue[N];
 int branchCount, junctionCount;
 float depthLow, depthHigh;
+int depthKind = 0; // 0: inverse-like relative DA2; 1: positive camera Z in meters
 
 inline int minI(int a, int b) { return a < b ? a : b; }
 inline int maxI(int a, int b) { return a > b ? a : b; }
@@ -47,7 +48,7 @@ inline void rawNeighbours(int x, int y, uint8_t p[8]) {
 }
 inline void point(float x, float y, float d, float fx, float fy, float cx, float cy, float out[3]) {
     const float nearValue = clampF((d-depthLow)/(depthHigh-depthLow+1e-6f),0,1);
-    const float z = 1.0f/(0.2f+0.8f*nearValue);
+    const float z = depthKind == 1 ? d : 1.0f/(0.2f+0.8f*nearValue);
     const float px = ((x-cx)/fx)*z, py = -((y-cy)/fy)*z, pz = -z;
     for(int k=0;k<3;k++) out[k]=rotation[k*3]*px+rotation[k*3+1]*py+rotation[k*3+2]*pz;
 }
@@ -65,6 +66,7 @@ int16_t* bd_junctions() { return junctionData; }
 int bd_branch_count() { return branchCount; }
 int bd_junction_count() { return junctionCount; }
 int bd_fields() { return FIELDS; }
+void bd_set_depth_kind(int kind) { depthKind = kind == 1 ? 1 : 0; }
 
 // Unfiltered Zhang-Suen thinning of the 2x2-downsampled visible segmentation.
 // This deliberately does not inspect depth, RGB, component size, or branch IDs.
@@ -117,7 +119,8 @@ int bd_run(float fx, float fy, float cx, float cy, int worldUp) {
         if(!covered) continue;
         float d=0; int dn=0;
         const int offsets[4]={0,1,640,641};
-        for(int t=0;t<4;t++) { float v=depth[j+offsets[t]]; if(v==v && v>-1e20f && v<1e20f) { d+=v;dn++; } }
+        for(int t=0;t<4;t++) { int q=j+offsets[t];float v=depth[q];
+            if(mask[q] && v==v && v>-1e20f && v<1e20f && (depthKind==0||v>0)) { d+=v;dn++; } }
         if(!dn) continue;
         foreground[i]=skeleton[i]=1; smallDepth[i]=d/dn;
         xmin=minI(xmin,x);xmax=maxI(xmax,x);ymin=minI(ymin,y);ymax=maxI(ymax,y);count++;
@@ -313,9 +316,11 @@ int bd_run(float fx, float fy, float cx, float cy, int worldUp) {
         float rayVertical=absF(ray[up]/rayNorm),pseudoVertical=absF(axis[up]);
         // Monocular relative depth can bend an otherwise straight centerline.
         // Prefer the camera-corrected image tangent when the two disagree.
-        float vertical=(pseudoConfidence>=0.7f&&b[7]>=0.85f&&absF(pseudoVertical-rayVertical)<=0.25f)?pseudoVertical:rayVertical;
+        float vertical=depthKind == 1 ? pseudoVertical :
+            ((pseudoConfidence>=0.7f&&b[7]>=0.85f&&absF(pseudoVertical-rayVertical)<=0.25f)?pseudoVertical:rayVertical);
         b[6]=b[20]=clampF(vertical,0,1);
-        b[21]=clampF(imageConfidence*(pseudoConfidence>=0.7f?pseudoConfidence:0.75f),0,1);
+        b[21]=clampF(imageConfidence*(depthKind == 1 ? pseudoConfidence :
+            (pseudoConfidence>=0.7f?pseudoConfidence:0.75f)),0,1);
         float lengthScore=clampF(b[2]/180,0,1),widthScore=clampF(b[4]/12,0,1);
         float slenderness=clampF((b[2]/(b[4]+1e-6f)-1)/4,0,1);
         b[1]=(0.35f*lengthScore+0.2f*b[5]+0.2f*(1-b[6])+0.15f*b[7]+0.1f*widthScore)*slenderness;

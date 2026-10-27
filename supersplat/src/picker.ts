@@ -170,8 +170,8 @@ class Picker {
         return result;
     }
 
-    // Prepare for depth picking by rendering the specified splat
-    prepareDepth(splat: Splat) {
+    // Render depth for one splat, or for every visible splat in the scene.
+    prepareDepth(splat: Splat | null = null) {
         if (!this.depthRenderTarget) {
             return;
         }
@@ -180,11 +180,9 @@ class Picker {
         const { app, camera, splatLayer } = scene;
         const emptyMap = new Map();
 
-        // Hide non-selected elements
+        // Single-point picking isolates its splat; a full depth map uses all visible splats.
         const splats = scene.getElementsByType(ElementType.splat) as Splat[];
-        splats.forEach((s) => {
-            s.entity.enabled = s === splat;
-        });
+        if (splat) splats.forEach(s => { s.entity.enabled = s === splat; });
 
         // Set depth estimation mode uniform
         this.device.scope.resolve('pickOp').setValue(2); // 'set' mode - don't skip any visible splats
@@ -198,9 +196,26 @@ class Picker {
         this.renderPass.render();
 
         // Re-enable all splats
-        splats.forEach((s) => {
-            s.entity.enabled = true;
-        });
+        if (splat) splats.forEach(s => { s.entity.enabled = true; });
+    }
+
+    // Read camera-forward depth in scene units, with NaN for uncovered pixels.
+    async readDepthMap(near: number, far: number): Promise<Float32Array> {
+        const rt = this.depthRenderTarget;
+        if (!rt) throw new Error('Depth render target is unavailable');
+        const pixels = await rt.colorBuffer.read(0, 0, rt.width, rt.height, { renderTarget: rt });
+        const depth = new Float32Array(rt.width * rt.height);
+        for (let y = 0; y < rt.height; y++) {
+            const sourceY = this.device.isWebGL2 ? rt.height - 1 - y : y;
+            for (let x = 0; x < rt.width; x++) {
+                const offset = (sourceY * rt.width + x) * 4;
+                const alpha = 1 - half2Float(pixels[offset + 3]);
+                const normalized = alpha > 0.05 ? half2Float(pixels[offset]) / alpha : NaN;
+                depth[y * rt.width + x] = Number.isFinite(normalized) ?
+                    near + normalized * (far - near) : NaN;
+            }
+        }
+        return depth;
     }
 
     // Read normalized depth (0-1) at normalized screen position (0-1 range) (after prepareDepth)

@@ -37,7 +37,7 @@ http://localhost:8027/app/?load=../path/to/model.ply&filename=model.ply&control=
 
 The app must be served over HTTP. Opening `app/index.html` directly from disk is not reliable because the browser needs to fetch `.ply`, `.wasm`, and app assets.
 
-## Live RGB / Segmentation / DA2 Depth / Camera Pose
+## Live RGB / Segmentation / DA2 vs 3DGS Depth
 
 Start the annotation app with its persistent Depth Anything V2 Small service:
 
@@ -55,7 +55,7 @@ Use `--da2-source /path/to/Depth-Anything-V2`, `--checkpoint /path/to/model.pth`
 
 When served from the parent project, open
 `http://localhost:8027/3dgs-splat-labeler/app/` and load a PLY. The bottom-right
-BBox Manager now shows RGB, segmentation, relative depth and camera pose.
+BBox Manager shows shared RGB/segmentation, both depth maps, and paired branch-analysis stages.
 Add `boxes3d=/annotations/dji_0967_saved_boxes_3d.json` to the DJI model URL
 to restore the eight BBoxes saved in `~/Downloads/boxes_3d.json`. A `metricScale`
 URL parameter keeps the scene's current metric calibration when importing older
@@ -82,83 +82,58 @@ explicitly select either convention.
   ≥50% of total opacity, with total opacity ≥0.05. It does not alter editor selection.
 - `Binary mask` switches the preview between a yellow RGB overlay and the binary
   mask. No boxes produces an empty mask. Raw RGB excludes edit handles/highlights.
-- Depth is the raw DA2 relative output, not meters. The color preview uses
-  per-frame 2nd/98th percentiles (blue far, red near). It does not change raw values.
-- The fourth tile defaults to **Raw skeleton**: magenta skeleton pixels over
-  the synchronized RGB view. It thins the visible segmentation at 320×320
-  with Zhang–Suen, then displays only pixels inside the 640×640 visible mask.
-  It retains isolated components and does not use depth, size, direction,
-  trunk, or landing-rank filters. The raw skeleton appears as soon as RGB and
-  segmentation are ready, even while DA2 is still computing. Use **View →
-  Landing candidates** to inspect the existing filtered result; its search
-  controls appear in that mode.
-- The fifth tile defaults to **colored links**: each raw skeleton segment between
-  junctions gets a distinct color, expanded only within the visible segmentation
-  mask. Both images zoom to the raw skeleton for inspection. The left image keeps
-  every 2D link separate. The right preserves a distinct object ID for every
-  junction arm, regardless of whether DA2 estimates similar or different depths.
-  DA2 can split a continuous 2D link further where its relative depth jumps;
-  loops returning to a junction are also separated, and the caption shows the
-  resulting object count and added cuts. Check **Show
-  junctions** to switch both images to the earlier junction display: yellow
-  marks every 2D topological junction; teal means similar arm depths, orange
-  means a depth gap, and gray means insufficient samples. A gap is marked when
-  it reaches 15% of the frame's robust relative-depth range and exceeds local
-  variation. This depth-guided grouping is a heuristic, not proof of physical
-  connectivity; DA2 does not provide metric depth. Junction arms are never
-  rejoined. The 2D side appears before DA2 finishes.
-- The sixth tile fits a 3D PCA axis to every DA2-separated segmentation object
-  using its visible mask pixels, camera intrinsics/rotation, and DA2 relative
-  depth. White lines mark reliable principal axes on the left; the right colors
-  the merged objects. Adjust **Maximum relative axis angle** from 0–90° in
-  either the normal or maximized BBox Manager. Only neighboring objects with a
-  local DA2 gap ≤15% of the frame's robust depth range and reliable axes can
-  merge; all axes in a merged group must satisfy the chosen sign-independent
-  angle. Changing the angle recomputes the grouping from the current frame
-  without rerunning DA2. These are dimensionless pseudo-3D axes, not metric
-  cylinder fits.
-- The seventh tile first compares **each unmerged DA2 segment's PCA axis** with
-  gravity and drops segments that fail. It then merges only survivors using the
-  sixth tile's relative-axis-angle setting, pools their PCA moments, and checks
-  the merged axes against gravity again. The left image shows the survivors
-  after merging; the right highlights those still passing. The sixth tile stays
-  unfiltered for comparison. **Maximum deviation from 90°** (default 20°)
-  applies at both stages and keeps reliable axes whose unsigned angle to the
-  scene's gravity axis lies in 70–90° by default. A value of 0°
-  requires an exactly horizontal axis; 90° admits every reliable axis.
-  **Minimum skeleton
-  length** (default 12 px) measures each merged object's raw centerline in
-  640×640 image pixels. **Exclude trunks** is off by default; when checked it
-  removes objects whose centerline substantially overlaps branches marked as
-  trunks by the existing detector. Changing the PCA merge angle or any seventh-
-  tile filter updates the current frame without rerunning DA2. Length is not
-  metric, and the angles use relative-depth pseudo-3D.
-- The eighth tile produces the **final landing candidate segmentation** from
-  the seventh tile's surviving objects. It rejects wide regions, weak 3D PCA
-  lines, inconsistent relative depth, and regions too low in the visible
-  annotation's gravity-aligned pseudo-3D height range. Adjust maximum apparent
-  width (default 24 image px), minimum PCA linearity (0.5), maximum relative
-  depth spread (0.3), minimum relative height (0.25), minimum non-green fraction
-  (0.25), and final Top K (3). **Reject green foliage** is on by default.
-  The final stage keeps the original DA2 junction-split link IDs even if PCA
-  merged them upstream, so a Y junction becomes separate branch instances.
-  It screens each link's non-green pixels with a pseudo-3D PCA axis and a
-  narrow projected cylinder corridor; green foliage pixels do not enter the
-  output mask. This is deliberately conservative where bark is hidden by leaves.
-  **Camera approach** prefers a center near the optical axis (default allowance
-  30°), an axis across rather than toward the camera (default maximum toward-
-  camera deviation 30°), and a nearly horizontal projection (default screen-
-  tilt allowance 30°). By default these angles affect ranking without hiding
-  every otherwise valid branch. Check **Require angles** to apply them as hard
-  limits; setting all three sliders to 90° allows every camera orientation.
-  They use the captured pose and camera-relative direction, not metric DA2
-  distance. The angles, ranking score, and strict-mode setting are saved.
-  The left image shows the seventh-stage input; the right overlays only the
-  selected instance regions on RGB. **View → Final segmentation** also shows
-  them in the fourth tile and, when **Show on main view** is checked, over the
-  main camera. IDs are stable within a frame and the mask never extends beyond
-  the visible annotation. These are geometric candidates; DA2 depth cannot
-  establish metric branch diameter, clearance, or load capacity.
+- DA2 and 3DGS use the same captured RGB, annotation mask, intrinsics, and pose.
+  Every comparison row keeps **DA2 on the left and 3DGS on the right**: depth
+  support, depth-aware skeleton, separated branches, PCA axes, merged regions,
+  gravity-filtered regions, and final landing branches. Source-local IDs are
+  not cross-source correspondences.
+- **Depth gap / robust range** (default 0.15) acts before skeletonization.
+  Each 2×2 masked cell contributes its median valid depth. An eight-neighbor
+  jump above the threshold times that source's 2nd–98th percentile depth range
+  removes the far-side cell as a one-cell barrier, then the remaining mask is
+  thinned at 320×320. Orange shows depth barriers; gray shows missing depth.
+  Unknown/nonpositive 3DGS depth is excluded rather than filled from DA2.
+  Constant depth preserves the mask. Depth support can therefore change the
+  skeleton itself, not just later ranking.
+- DA2 keeps its raw inverse-like relative values and dimensionless pseudo-3D
+  reconstruction. 3DGS uses its positive camera-forward depth directly with
+  camera intrinsics and the current meters-per-scene-unit calibration. Its
+  PCA and final geometry use approximate meters, without DA2's inverse mapping
+  or image-tangent fallback. Both depth previews use robust percentile colors;
+  multiplying the 3DGS scale changes coordinates, not the normalized colors.
+- Expand **Shared PCA, gravity and landing filters** to adjust both paths
+  together. PCA uses the same maximum axis angle (default 20°) and normalized
+  depth-gap condition. All member axes must agree before adjacent regions
+  merge. Gravity accepts a merged axis or a reliable component within 20° of
+  horizontal by default; **Require each component horizontal** applies the
+  stricter gate. Minimum skeleton length is 12 image pixels for DA2 and 10 cm for 3DGS; **Exclude trunks**
+  is off by default. These controls use cached depths and do not rerun DA2.
+- 3DGS skeleton length is a visible 3D arc length in cm: backproject the
+  depth at each skeleton node with the captured intrinsics, sum each undirected
+  connection once, and avoid diagonal shortcuts at corners. Missing depth is
+  not bridged. Skeleton and final-branch captions show cm, and hovering over a
+  skeleton/region shows that link's length. Merged-region lengths sum their
+  component links. DA2 does not receive an invented cm conversion.
+- The final stage preserves source junction-link IDs and applies the existing
+  landing criteria independently: maximum apparent width 24px, minimum 3D
+  linearity 0.5, image linearity 0.6, cylinder inlier fraction 0.4, maximum
+  relative depth spread 0.3, minimum relative height 0.1, non-green fraction
+  0.25, and Top K 3. Green foliage rejection is on. Camera approach allowances
+  are 30° for center bearing, end-on deviation, and screen tilt; they affect
+  ranking unless **Require angles** is checked. Angle/ratio/projected-width thresholds
+  are shared. Skeleton length has separate DA2-pixel and 3DGS-cm controls. Hover over
+  either final image to see its source ID and rejection reasons.
+- Final mask difference uses white for overlap, cyan for DA2-only, and magenta
+  for 3DGS-only pixels. IoU measures mask overlap, not accuracy against ground
+  truth. Two empty masks are explicitly reported. **Main overlay** selects
+  DA2, 3DGS (default), or final-mask difference; **View** selects skeleton,
+  landing candidates, or final segmentation. Both columns use one annotation
+  crop; disable **Zoom to annotation** to see the full frame.
+- Analyses run in separate workers, tagged by frame, source, and settings
+  revision. A source can finish while the other is still running or has failed.
+  Camera/annotation changes discard stale responses. The source-specific
+  results are available under `annotation.liveSnapshot.analyses.da2` and
+  `.analyses['3dgs']`; legacy detection/filter fields remain DA2 aliases.
 - The simulated camera pose is read from the current frame. To feed an IMU
   gravity direction pointing **toward the ground** in camera coordinates, call
   `scene.events.invoke('annotation.setImuGravity', {frame:'camera', vector:[x,y,z], captured_at_utc:'...'})`
@@ -170,11 +145,11 @@ explicitly select either convention.
   vector and its source.
 - The landing-candidate mode shows branch instances and ranked landing
   candidates over the current RGB frame. A C++17 core uses
-  RGB, the visible annotation mask, DA2 relative depth, camera intrinsics, and
+  RGB, each depth-prepared annotation mask, its depth values, camera intrinsics, and
   camera rotation. It thins the 320×320 mask, splits centerlines at junctions,
   assigns visible pixels to branches, and ranks slender, long, relatively level
-  candidates. Visible mask pixels are projected into **dimensionless pseudo-3D**;
-  DA2 does not provide metric depth, so the scores are inspection candidates,
+  candidates. DA2 pixels are projected into **dimensionless pseudo-3D** and 3DGS pixels into
+  calibrated geometry. Scores are inspection candidates,
   not physical landing or load-bearing decisions. The worker processes a
   stationary synchronized frame; it does not infer while the camera is moving.
 - Use **maximize** in the BBox Manager header to open a split view: the live
@@ -188,7 +163,7 @@ explicitly select either convention.
   The numbers 1, 2, 3... are score ranks; the separate ID is the branch's
   instance ID in that frame. **Show on main
   view** overlays those same candidates on the camera viewport with translucent
-  colors and numbered labels. It is on by default and clears the overlay as
+  colors from the selected depth source. It is on by default and clears the overlay as
   soon as the camera or annotations change, until a matching frame is ready.
   Detection continues for the main view even while the BBox Manager is hidden.
 - **Yellow segmentation** toggles the yellow selection tint in the main view
@@ -204,8 +179,22 @@ explicitly select either convention.
   original segmentation mask remains intact. Eligible **Ground-parallel** candidates
   are scored and the selected top K are outlined in cyan and listed by rank.
   Rank is based on a heuristic score, not physical landing safety.
-- `Save Current Set` becomes available after the current frame's depth and
-  branch detection finish.
+- **Save Figures** in the BBox Manager header saves every current panel figure
+  as PNG, including stages below the scroll position. It exports RGB,
+  the displayed segmentation, both depth previews, both sources' depth support,
+  skeleton, separated regions, PCA axes, merged regions, gravity-filtered regions,
+  final branches, and the final difference view (19 individual 640×640 PNGs).
+  `overview.png` adds a two-column comparison with titles, captions, frame ID,
+  current crop, calibration and filter values. The displayed zoom, colors and
+  overlays are captured at button-click time before the folder chooser opens.
+  Saving also works for a paused analysis; each image belongs to the captured
+  analysis frame. The files go under `Figures/<frame>_figures_<timestamp>/` in
+  the chosen output folder. If browser directory access is unavailable, one ZIP
+  download contains the same 20 PNG files. A cancelled folder chooser saves no
+  files. The button becomes available after both sources finish or report an
+  error and at least one source has a result.
+- `Save DA2 Set` becomes available after the current frame's DA2 depth and
+  branch detection finish, including when only the 3DGS analysis has failed.
   Choose a folder to save `RGB/*.png`, `Mask/*.png`, `Depth/*.npy`,
   `Depth/*_preview.png`, `Pose/*.json`, `Branches/*_instances.png`,
   `Branches/*.json`, `Landing/*_ids.npy`, `Landing/*_preview.png`, and
@@ -226,12 +215,11 @@ explicitly select either convention.
   intrinsics, XYZ/quaternion, camera-to-world, world-to-camera, and projection.
   Matrices are row-major; the camera uses OpenGL axes (+X right, +Y up, −Z forward).
   Translation is in scene units; calibrated meter position is recorded separately.
-  `Copy Pose JSON` copies the current frame's pose even though the fourth tile
-  shows the branch result.
+  `Copy Pose JSON` copies the shared captured camera pose.
 
 The plain static `serve.sh` still opens the editor, but DA2 requires this Python
 service. Legacy current-view/spiral/random/LOS export retains its existing format;
-use `Save Current Set` for the new synchronized visible-mask/depth dataset.
+use `Save DA2 Set` for the new synchronized visible-mask/depth dataset.
 
 The CPU postprocessor is shared by the browser WebAssembly worker and the native
 benchmark. Rebuild both after editing it:
@@ -259,8 +247,10 @@ without requiring a WebAssembly toolchain.
 
 ```bash
 python -m unittest discover -s tests -p 'test_depth_server.py'
-node --test tests/test_live_view.mjs
+node --test tests/test_figure_export.mjs tests/test_live_view.mjs tests/test_depth_comparison.mjs tests/test_final_landing_analysis.mjs tests/test_pca_link_analysis.mjs tests/test_junction_analysis.mjs
 # With the depth server running on 8027, installed Chrome and the DJI PLY:
+node tests/integration_depth_comparison.mjs
+# Camera, annotations, shared filter controls and legacy DA2 exports:
 node tests/integration_live_view.mjs
 cd supersplat
 ./node_modules/.bin/tsc --noEmit
@@ -308,7 +298,7 @@ This rebuilds `supersplat/dist/` and copies it into `app/`.
 ## Annotation Workflow
 
 1. Load a 3DGS `.ply`.
-2. Calibrate scale if needed: use the `Measurement` tool, measure a known length, type the real length in meters, then click `Apply Scale`.
+2. Calibrate scale if needed: use the `Measurement` tool, measure a known length, type the real length in meters, then click `Apply Scale`. Alternatively, select a fitted BBox, choose its X/Y/Z axis under `BBox dimension → 3DGS depth scale`, enter that side's measured real length in meters, and leave the field (or click `Apply Box Scale`). This changes the scene's meters-per-unit scale without resizing the BBox. The calibrated value and the reference BBox/axis/measurement are written to the URL so they survive reload, replacing an older `metricScale` URL reference. The reference is also included in annotation exports and pose/depth metadata; 3DGS depth and cm arc lengths explicitly use this scale.
 3. Click `Draw BBox`, then click visible splat points to append 10cm bbox segments.
 4. Use `Add +BBox` for regions that should be segmented and `Add Remove BBox` for regions that should be subtracted. Segmentation is `(union of include bboxes) - (union of remove bboxes)`.
 5. Use `Undo Step` to revert the last bbox operation, or `Delete BBox` to delete the active bbox itself.
@@ -317,6 +307,7 @@ This rebuilds `supersplat/dist/` and copies it into `app/`.
 8. Click `Export View RGB+Mask` for the current renderer camera.
 
 After scale calibration, bbox center/size fields and spiral capture radii are shown and edited in meters. Exports include both calibrated meter values and raw scene-unit values.
+The live panel displays DA2 relative depth alongside 3DGS opacity-weighted depth from the same camera pose. The 3DGS preview and `_3dgs_m.npy` export use the current meters-per-scene-unit calibration; uncovered pixels are NaN. The screen compares both depth-aware analyses; existing branch/landing exports continue to use DA2. New 3DGS branch-label dataset exports are deferred. The calibrated 3DGS depth is approximate geometry, especially around thin or translucent branches.
 When multiple bboxes exist, the visible segmented splats and exported mask are the union of include boxes minus the union of remove boxes. The per-bbox records remain in JSON so annotators can see how each 3D box contributed to the semantic mask.
 
 Use `Export 3D` to save the complete bbox state as `boxes_3d.json`. To resume later, load the same 3DGS scene, click `Import 3D`, and select that JSON file. Import restores include/remove roles, centers, sizes, rotations, active selection, and the exported metric scale unless a `metricScale` URL parameter supplies a newer calibration. The current bbox state is placed on the undo stack before replacement.

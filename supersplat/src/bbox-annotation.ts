@@ -3,6 +3,8 @@ import { Color, Mat4, Ray, Vec3 } from 'playcanvas';
 import { ElementType } from './element';
 import { Events } from './events';
 import { LiveView } from './live-view';
+import { parseBoxScaleReference } from './live-view-utils';
+import type { BoxScaleReference } from './live-view-utils';
 import { Scene } from './scene';
 import { Splat } from './splat';
 import { State } from './splat-state';
@@ -325,11 +327,15 @@ class BBoxAnnotation {
     drawRay = new Ray();
     drawDepth = 0.1;
     metersPerSceneUnit = 1;
+    boxScaleReference: BoxScaleReference | null = null;
+    boxCalibrationEditingId = '';
     metricScalePinnedByUrl = false;
     metricInput: HTMLInputElement;
     cubeMetersInput: HTMLInputElement;
     calibrationMeasuredInput: HTMLInputElement;
     calibrationActualInput: HTMLInputElement;
+    boxCalibrationAxis: HTMLSelectElement;
+    boxCalibrationMetersInput: HTMLInputElement;
     metricSummary: HTMLDivElement;
     lastMeasuredSceneLength = 0;
     outputDirHandle: any = null;
@@ -369,6 +375,7 @@ class BBoxAnnotation {
                 splat: this.activeSplat(),
                 boxes,
                 metersPerSceneUnit: this.metersPerSceneUnit,
+                scaleReference: this.boxScaleReference,
                 contains: (point: Vec3) => this.pointInSegmentationBoxes(point, include, exclude)
             };
         }, () => this.outputDirHandle, () => this.chooseOutputFolder(),
@@ -444,11 +451,16 @@ class BBoxAnnotation {
         const stored = Number(localStorage.getItem(metricStorageKey) ?? '');
         if (Number.isFinite(metersPerSceneUnit) && metersPerSceneUnit > 0) {
             this.metersPerSceneUnit = metersPerSceneUnit;
+            this.metricScalePinnedByUrl = true;
         } else if (Number.isFinite(sceneUnitsPerMeter) && sceneUnitsPerMeter > 0) {
             this.metersPerSceneUnit = 1 / sceneUnitsPerMeter;
+            this.metricScalePinnedByUrl = true;
         } else if (Number.isFinite(stored) && stored > 0) {
             this.metersPerSceneUnit = stored;
         }
+        try {
+            this.boxScaleReference = parseBoxScaleReference(JSON.parse(url.searchParams.get('scaleReference') ?? 'null'), this.metersPerSceneUnit);
+        } catch { this.boxScaleReference = null; }
     }
 
     sceneToMeters(value: number) {
@@ -483,7 +495,21 @@ class BBoxAnnotation {
         const randomOuterRadius = this.randomOuterRadiusInput ? this.randomOuterRadiusScene() : null;
         const randomInnerCylinder = this.randomInnerCylinderInput ? this.randomInnerCylinderScene() : null;
         this.metersPerSceneUnit = value;
+        if (!source.startsWith('BBox ')) this.boxScaleReference = null;
         localStorage.setItem(metricStorageKey, `${value}`);
+        if (source === 'calibration' || source === 'manual input' || source.startsWith('BBox ')) {
+            const url = new URL(window.location.href);
+            url.searchParams.delete('metricScale');
+            url.searchParams.delete('metric-scale');
+            url.searchParams.delete('mpsu');
+            url.searchParams.delete('sceneUnitsPerMeter');
+            url.searchParams.delete('supm');
+            url.searchParams.set('metersPerSceneUnit', `${value}`);
+            if (this.boxScaleReference) url.searchParams.set('scaleReference', JSON.stringify(this.boxScaleReference));
+            else url.searchParams.delete('scaleReference');
+            window.history.replaceState(window.history.state, '', url);
+            this.metricScalePinnedByUrl = true;
+        }
         this.writeMetricInputs();
         this.writeInputs();
         this.writeSpiralInputsFromSceneValues(spiralCenter, spiralRadii);
@@ -512,6 +538,26 @@ class BBoxAnnotation {
         this.lastMeasuredSceneLength = measuredScene;
         this.setMetersPerSceneUnit(actualMeters / measuredScene, 'calibration');
         this.calibrationActualInput.value = actualMeters.toFixed(4);
+    }
+
+    applyBoxScaleCalibration() {
+        this.readInputs(false);
+        if (!this.boxes.length) {
+            this.status('calibration error: select a BBox first');
+            return;
+        }
+        const axis = Number(this.boxCalibrationAxis.value);
+        const sceneLength = this.box.size[axis];
+        const actualMeters = Number(this.boxCalibrationMetersInput.value);
+        if (!Number.isFinite(sceneLength) || sceneLength <= 0 ||
+            !Number.isFinite(actualMeters) || actualMeters <= 0) {
+            this.status('calibration error: BBox size and actual length must be positive');
+            return;
+        }
+        const boxId = this.box.id;
+        this.boxScaleReference = { source: 'bbox', box_id: boxId, axis: 'XYZ'[axis] as BoxScaleReference['axis'],
+            scene_length: sceneLength, actual_length_m: actualMeters };
+        this.setMetersPerSceneUnit(actualMeters / sceneLength, `BBox ${boxId} ${'XYZ'[axis]}`);
     }
 
     installStyle() {
@@ -598,6 +644,8 @@ class BBoxAnnotation {
             }
             .bbox-annotation button:hover,
             .bbox-preview button:hover { border-color: #60768d; background: #1d2d3f; }
+            .bbox-manager > .bbox-preview-head { flex-wrap: wrap; gap: 6px; }
+            .bbox-preview button:disabled { opacity: .45; cursor: default; }
             .bbox-annotation button.active {
                 color: #041018;
                 background: #55c7ff;
@@ -1158,6 +1206,16 @@ class BBoxAnnotation {
         head.className = 'bbox-preview-head';
         const title = document.createElement('span');
         title.textContent = 'BBox Manager';
+        const saveFigures = this.button('Save Figures', () => {
+            this.liveView.saveFigures().catch(error => {
+                saveFigures.title = `Figure save failed: ${error.message}`;
+                this.liveView.message('error', `Figure save error: ${error.message}`);
+            });
+        });
+        saveFigures.dataset.action = 'save-figures';
+        saveFigures.setAttribute('aria-label', 'Save all BBox Manager figures as PNG');
+        saveFigures.title = 'Save current RGB, mask, depths and all comparison figures as PNG';
+        saveFigures.disabled = true;
         const maximize = document.createElement('button');
         maximize.textContent = 'maximize';
         maximize.setAttribute('aria-label', 'Maximize BBox Manager');
@@ -1185,7 +1243,7 @@ class BBoxAnnotation {
             root.classList.toggle('collapsed');
             toggle.textContent = root.classList.contains('collapsed') ? 'show' : 'hide';
         });
-        head.append(title, maximize, toggle);
+        head.append(title, saveFigures, maximize, toggle);
 
         const body = document.createElement('div');
         body.className = 'bbox-preview-body';
@@ -1665,10 +1723,34 @@ class BBoxAnnotation {
             this.button('Apply Scale', () => this.applyScaleCalibration())
         );
 
+        const boxCalibrationLabel = this.label('BBox dimension → 3DGS depth scale');
+        const boxCalibration = document.createElement('div');
+        boxCalibration.className = 'bbox-row';
+        this.boxCalibrationAxis = document.createElement('select');
+        [['0', 'X width'], ['1', 'Y height'], ['2', 'Z depth']].forEach(([value, label]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = label;
+            this.boxCalibrationAxis.appendChild(option);
+        });
+        this.boxCalibrationMetersInput = document.createElement('input');
+        this.boxCalibrationMetersInput.type = 'number';
+        this.boxCalibrationMetersInput.min = '0.000001';
+        this.boxCalibrationMetersInput.step = '0.01';
+        this.boxCalibrationMetersInput.placeholder = 'actual meters';
+        this.boxCalibrationMetersInput.title = 'Measured real-world length of the selected BBox axis in meters';
+        this.boxCalibrationMetersInput.setAttribute('aria-label', 'Measured BBox side in meters');
+        this.boxCalibrationMetersInput.addEventListener('change', () => {
+            if (this.boxCalibrationMetersInput.value.trim()) this.applyBoxScaleCalibration();
+        });
+        this.boxCalibrationAxis.addEventListener('change', () => { this.boxCalibrationMetersInput.value = ''; });
+        boxCalibration.append(this.boxCalibrationAxis, this.boxCalibrationMetersInput,
+            this.button('Apply Box Scale', () => this.applyBoxScaleCalibration()));
+
         this.metricSummary = document.createElement('div');
         this.metricSummary.className = 'bbox-status';
 
-        wrap.append(row, calibration, actions, this.metricSummary);
+        wrap.append(row, calibration, actions, boxCalibrationLabel, boxCalibration, this.metricSummary);
         this.writeMetricInputs();
         return wrap;
     }
@@ -1900,7 +1982,10 @@ class BBoxAnnotation {
             this.cubeMetersInput.value = `${defaultCubeMeters}`;
         }
         if (this.metricSummary) {
-            this.metricSummary.textContent = `1 scene unit = ${this.metersPerSceneUnit.toFixed(6)} m, 1 m = ${(1 / Math.max(this.metersPerSceneUnit, 1e-9)).toFixed(4)} scene units`;
+            const reference = this.boxScaleReference;
+            this.metricSummary.textContent = `1 scene unit = ${this.metersPerSceneUnit.toFixed(6)} m · ` +
+                (reference ? `3DGS reference: ${reference.box_id} ${reference.axis} = ${(reference.actual_length_m * 100).toFixed(1)} cm` :
+                    '3DGS uses the current scale; enter a measured BBox side to calibrate.');
         }
     }
 
@@ -1945,6 +2030,12 @@ class BBoxAnnotation {
         ['cx', 'cy', 'cz'].forEach((id, i) => set(id, this.box.center[i]));
         ['sx', 'sy', 'sz'].forEach((id, i) => set(id, this.box.size[i]));
         ['rx', 'ry', 'rz'].forEach((id, i) => set(id, this.box.euler[i]));
+        if (this.boxCalibrationMetersInput && this.boxCalibrationEditingId !== this.box.id) {
+            this.boxCalibrationEditingId = this.box.id;
+            const reference = this.boxScaleReference;
+            this.boxCalibrationMetersInput.value = reference?.box_id === this.box.id ? `${reference.actual_length_m}` : '';
+            if (reference?.box_id === this.box.id) this.boxCalibrationAxis.value = `${'XYZ'.indexOf(reference.axis)}`;
+        }
         if (this.boxes.length) {
             this.boxes[this.activeBoxIndex] = cloneBox(this.box);
         }
@@ -3019,6 +3110,7 @@ class BBoxAnnotation {
             units: 'meters',
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
+                reference: this.boxScaleReference,
                 scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
             },
             boxes: this.boxes.map((box, index) => {
@@ -3150,6 +3242,10 @@ class BBoxAnnotation {
         if (sceneMetricScale !== this.metersPerSceneUnit) {
             this.setMetersPerSceneUnit(sceneMetricScale, `3D import ${source}`);
         }
+        if (!this.metricScalePinnedByUrl) {
+            this.boxScaleReference = parseBoxScaleReference(payload?.metric_scale?.reference, this.metersPerSceneUnit);
+            this.writeMetricInputs();
+        }
         this.boxes = imported.map(entry => cloneBox(entry.box));
         this.activeBoxIndex = Math.max(0, imported.findIndex(entry => entry.active));
         if (this.boxes.length) {
@@ -3223,6 +3319,7 @@ class BBoxAnnotation {
         try {
             const metricUrl = new URL(url, window.location.href);
             const meta = await (await fetch(metricUrl)).json();
+            if (this.boxScaleReference) return;
             const metersPerSceneUnit = Number(meta.meters_per_scene_unit ?? meta.metersPerSceneUnit);
             const sceneUnitsPerMeter = Number(meta.scene_units_per_meter ?? meta.sceneUnitsPerMeter);
             if (Number.isFinite(metersPerSceneUnit) && metersPerSceneUnit > 0) {
@@ -3233,6 +3330,7 @@ class BBoxAnnotation {
                 throw new Error('missing meters_per_scene_unit or scene_units_per_meter');
             }
             this.metricScalePinnedByUrl = true;
+            this.boxScaleReference = parseBoxScaleReference(meta.reference, this.metersPerSceneUnit);
             this.writeMetricInputs();
             this.status(`metric scale loaded: 1 scene unit = ${this.metersPerSceneUnit.toFixed(4)}m`);
         } catch (err) {
@@ -3904,6 +4002,7 @@ class BBoxAnnotation {
             units: 'meters',
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
+                reference: this.boxScaleReference,
                 scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
             },
             target: targetMeters,
@@ -4102,6 +4201,7 @@ class BBoxAnnotation {
             units: 'meters',
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
+                reference: this.boxScaleReference,
                 scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
             },
             center: centerMeters,
@@ -4195,6 +4295,7 @@ class BBoxAnnotation {
             units: 'meters',
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
+                reference: this.boxScaleReference,
                 scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
             },
             center: centerMeters,
@@ -4283,6 +4384,7 @@ class BBoxAnnotation {
             units: 'meters',
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
+                reference: this.boxScaleReference,
                 scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
             },
             image: {
@@ -4466,6 +4568,7 @@ class BBoxAnnotation {
                     },
                     metric_scale: {
                         meters_per_scene_unit: this.metersPerSceneUnit,
+                reference: this.boxScaleReference,
                         scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
                     }
                 }] : []

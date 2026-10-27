@@ -191,7 +191,11 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
             await workTarget.colorBuffer.read(0, 0, width, height, { renderTarget: workTarget, data: rgb });
             flipY(membership, width, height);
             flipY(rgb, width, height);
-            return { rgb, membership, world, view, projection,
+            // The RGB buffer has been copied, so its shared target can hold a
+            // Gaussian opacity-weighted depth pass for the same frozen camera.
+            camera.picker.prepareDepth();
+            const depthScene = await camera.picker.readDepthMap(camera.near, camera.far);
+            return { rgb, membership, depthScene, world, view, projection,
                 position: [position.x, position.y, position.z],
                 quaternion: [rotation.x, rotation.y, rotation.z, rotation.w],
                 near: camera.near, far: camera.far };

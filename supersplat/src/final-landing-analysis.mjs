@@ -1,6 +1,8 @@
 // Per-link pseudo-3D cylinder screening. DA2 depth remains relative: widths
 // and fitted spans below are image-space cues, not physical load estimates.
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+import { cameraDepth, validDepth } from '../static/lib/branch-detector/depth-geometry.mjs';
+
 const WIDTH = 320, FULL = 640;
 const isGreenFoliage = (r, g, b) => g >= 35 && g - r >= 10 && g - b >= 8 &&
     g > r * 1.1 && g > b * 1.08;
@@ -59,7 +61,7 @@ export const resolveGravityWorld = (sample, pose) => {
 // labels is the accepted merged-object gate. sourceLabels keeps the original
 // DA2 skeleton links: PCA merging cannot reunite the arms of a Y junction.
 export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
-    sourceObjects = objects, mask, depth, rgb, pose, settings }) => {
+    sourceObjects = objects, mask, depth, rgb, pose, settings, depthKind = 'relative_inverse' }) => {
     if (labels.length !== WIDTH * WIDTH || sourceLabels.length !== labels.length ||
         mask.length !== FULL * FULL || depth.length !== mask.length || rgb.length !== mask.length * 4) {
         throw new Error('Final landing segmentation expects aligned 320/640 inputs');
@@ -69,7 +71,7 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
     const depthSamples = [];
     let sampled = 0;
     for (let p = 0; p < mask.length; p++) {
-        if (!mask[p] || !Number.isFinite(depth[p])) continue;
+        if (!mask[p] || !validDepth(depth[p], depthKind)) continue;
         if (sampled++ % 16 === 0) depthSamples.push(depth[p]);
     }
     depthSamples.sort((a, b) => a - b);
@@ -85,9 +87,8 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
     let visible = 0;
     for (let y = 0; y < FULL; y++) for (let x = 0; x < FULL; x++) {
         const p = y * FULL + x, small = (y >> 1) * WIDTH + (x >> 1);
-        if (!mask[p] || !Number.isFinite(depth[p])) continue;
-        const near = clamp((depth[p] - low) / depthRange, 0, 1);
-        const z = 1 / (0.2 + 0.8 * near);
+        if (!mask[p] || !validDepth(depth[p], depthKind)) continue;
+        const z = cameraDepth(depth[p], depthKind, low, high);
         const pointX = (x - cx) / fx * z, pointY = -(y - cy) / fy * z;
         const height = vertical[0] * pointX + vertical[1] * pointY - vertical[2] * z;
         if (visible++ % 4 === 0) allHeights.push(height);
@@ -129,6 +130,7 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
         const meanDepth = s.woodPx ? s.depthSum / s.woodPx : 0;
         const depthStdRelative = Math.sqrt(Math.max(0, s.depthSq / Math.max(1, s.woodPx) - meanDepth * meanDepth)) / depthRange;
         const centerlineLengthPx = object.centerlineLengthPx ?? 0;
+        const centerlineLengthCm = object.centerlineLengthCm ?? null;
         const apparentWidthPx = s.woodPx / Math.max(1, centerlineLengthPx);
         const radius = clamp(apparentWidthPx * 0.75, 1.5, settings.maxWidthPx / 2);
         let minT = Infinity, maxT = -Infinity;
@@ -176,10 +178,15 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
         const reasons = [];
         if (!s.areaPx || !fit.reliable) reasons.push('unreliable');
         if (woodFraction < (settings.minWoodyFraction ?? 0.25)) reasons.push('foliage');
-        if (centerlineLengthPx < settings.minLengthPx || fittedLengthPx < settings.minLengthPx * 0.5) reasons.push('short');
-        if (fit.linearity < settings.minLinearity || line.linearity < 0.65) reasons.push('low_linearity');
+        const tooShort = depthKind === 'camera_z_m' && settings.minLengthCm !== undefined ?
+            !Number.isFinite(centerlineLengthCm) || centerlineLengthCm < settings.minLengthCm :
+            centerlineLengthPx < settings.minLengthPx || fittedLengthPx < settings.minLengthPx * 0.5;
+        if (tooShort) reasons.push('short');
+        if (fit.linearity < settings.minLinearity ||
+            line.linearity < (settings.minProjectedLinearity ?? 0.65)) reasons.push('low_linearity');
         if (apparentWidthPx > settings.maxWidthPx || cylinderWidthPx > settings.maxWidthPx) reasons.push('wide');
-        if (corridorFraction < 0.65 || coverage < 0.5 || longestGap > 2) reasons.push('not_cylindrical');
+        if (corridorFraction < (settings.minCylinderInlierFraction ?? 0.65) ||
+            coverage < 0.5 || longestGap > 2) reasons.push('not_cylindrical');
         if (angleFromHorizontalDeg > (settings.maxAngleFromHorizontalDeg ?? 90)) reasons.push('tilted');
         if (settings.strictCameraAngles) {
             if (centerBearingDeg > (settings.maxCenterBearingDeg ?? 90)) reasons.push('off_center');
@@ -200,17 +207,20 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
             (1 + cylinderWidthPx / 12 + depthStdRelative * 2 + angleFromHorizontalDeg / 30);
         results.push({ id, merged_id: s.mergedId, area_px: s.areaPx, woody_area_px: s.woodPx,
             wood_fraction: woodFraction, centerline_length_px: centerlineLengthPx,
+            centerline_length_cm: depthKind === 'camera_z_m' ? centerlineLengthCm : null,
             fitted_length_px: fittedLengthPx, apparent_width_px: apparentWidthPx,
             cylinder_width_px: cylinderWidthPx, cylinder_inlier_fraction: corridorFraction,
             longitudinal_coverage: coverage, longest_empty_axial_bins: longestGap,
             projected_linearity: line.linearity,
             linearity: fit.linearity, angle_from_horizontal_deg: angleFromHorizontalDeg,
             center_px: line.center, center_camera_pseudo3d: centerCamera,
+            center_camera: centerCamera, geometry_units: depthKind === 'camera_z_m' ? 'approximate_meters' : 'relative_pseudo3d',
             center_bearing_deg: centerBearingDeg, side_on_deg: sideOnDeg,
             end_on_deviation_deg: endOnDeviationDeg,
             image_tilt_deg: imageTiltDeg, view_score: viewScore,
             relative_depth_std: depthStdRelative, relative_height: relativeHeight,
             mean_relative_depth: meanDepth,
+            mean_depth: meanDepth,
             mean_rgb: s.rgbSum.map(sum => Math.round(sum / Math.max(1, s.woodPx))),
             is_trunk: isTrunk, score: Number.isFinite(score) ? score : 0, reasons });
         if (!reasons.length) eligiblePixels.set(id, corridor);

@@ -1,8 +1,9 @@
-// DA2 is relative depth. These coordinates are dimensionless pseudo-3D, not meters.
+import { cameraDepth, validDepth } from './depth-geometry.mjs';
 const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
-export const analyzePcaSegments = (labels, mask, depth, intrinsics, rotation, width = 320) => {
+export const analyzePcaSegments = (labels, mask, depth, intrinsics, rotation, width = 320,
+    depthKind = 'relative_inverse', depthGapThreshold = 0.15) => {
     const full = width * 2;
     if (labels.length !== width * width || mask.length !== full * full || depth.length !== mask.length) {
         throw new Error('PCA expects matching 320-link and 640-mask/depth grids');
@@ -15,7 +16,7 @@ export const analyzePcaSegments = (labels, mask, depth, intrinsics, rotation, wi
         const p = (y * 2) * full + x * 2;
         let sum = 0, count = 0;
         for (const q of [p, p + 1, p + full, p + full + 1]) {
-            if (mask[q] && Number.isFinite(depth[q])) { sum += depth[q]; count++; }
+            if (mask[q] && validDepth(depth[q], depthKind)) { sum += depth[q]; count++; }
         }
         if (!count) continue;
         sampled[i] = sum / count;
@@ -28,8 +29,7 @@ export const analyzePcaSegments = (labels, mask, depth, intrinsics, rotation, wi
     const [fx, fy, cx, cy] = intrinsics;
     const point = (i, d) => {
         const x = i % width, y = Math.floor(i / width);
-        const near = clamp((d - low) / range, 0, 1);
-        const z = 1 / (0.2 + 0.8 * near);
+        const z = cameraDepth(d, depthKind, low, high);
         const camera = [((2 * x + 1 - cx) / fx) * z, -((2 * y + 1 - cy) / fy) * z, -z];
         return [0, 1, 2].map(k => rotation[k * 3] * camera[0] +
             rotation[k * 3 + 1] * camera[1] + rotation[k * 3 + 2] * camera[2]);
@@ -92,7 +92,7 @@ export const analyzePcaSegments = (labels, mask, depth, intrinsics, rotation, wi
         const angleDeg = Math.acos(clamp(Math.abs(dot(left.axis, right.axis)), 0, 1)) * 180 / Math.PI;
         const depthGap = edge.gapSum / edge.contacts;
         return { a: edge.a, b: edge.b, contacts: edge.contacts, angleDeg, depthGap,
-            eligible: left.reliable && right.reliable && depthGap <= 0.15 };
+            eligible: left.reliable && right.reliable && depthGap <= depthGapThreshold };
     }).sort((a, b) => a.angleDeg - b.angleDeg);
     return { objects, adjacency };
 };

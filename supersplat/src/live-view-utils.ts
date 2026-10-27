@@ -1,3 +1,16 @@
+export type BoxScaleReference = { source: 'bbox'; box_id: string; axis: 'X' | 'Y' | 'Z';
+    scene_length: number; actual_length_m: number };
+
+export const parseBoxScaleReference = (value: any, metersPerSceneUnit: number): BoxScaleReference | null => {
+    if (!Number.isFinite(metersPerSceneUnit) || metersPerSceneUnit <= 0 ||
+        !value || value.source !== 'bbox' || typeof value.box_id !== 'string' || !value.box_id.trim() ||
+        !['X', 'Y', 'Z'].includes(value.axis) || !Number.isFinite(value.scene_length) || value.scene_length <= 0 ||
+        !Number.isFinite(value.actual_length_m) || value.actual_length_m <= 0 ||
+        Math.abs(value.actual_length_m / value.scene_length - metersPerSceneUnit) > Math.max(1e-9, metersPerSceneUnit * 1e-6)) return null;
+    return { source: 'bbox', box_id: value.box_id, axis: value.axis,
+        scene_length: value.scene_length, actual_length_m: value.actual_length_m };
+};
+
 const SENSOR_PROFILE = Object.freeze({
     name: 'LI-IMX678-MIPI-HL-118H',
     native_width: 3856,

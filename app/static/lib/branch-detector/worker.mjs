@@ -1,5 +1,6 @@
 import { compareJunctionDepth, findRawJunctions, rawJunctionMarkers, segmentLinksByJunctionDepth, segmentSkeletonLinks } from './junction-analysis.mjs';
 import { analyzePcaSegments } from './pca-link-analysis.mjs';
+import { measureSkeletonLengths, prepareDepthMask } from './depth-geometry.mjs';
 
 const corePromise = (async () => {
     const response = await fetch(new URL('./branch_detector.wasm', import.meta.url));
@@ -32,7 +33,11 @@ self.onmessage = async ({ data }) => {
         if (data.rgb.length !== pixels * 4 || data.mask.length !== pixels || data.depth.length !== pixels) {
             throw new Error('Branch detector expects synchronized 640×640 inputs');
         }
+        const depthKind = data.depthKind ?? 'relative_inverse';
+        const prepared = data.depthAwareSkeleton ? prepareDepthMask(data.mask, data.depth, depthKind, data.gapThreshold) : null;
+        if (prepared) { data.mask = prepared.processedMask; latestRaw = null; }
         const memory = core.memory.buffer;
+        core.bd_set_depth_kind(depthKind === 'camera_z_m' ? 1 : 0);
         new Uint8Array(memory, core.bd_rgb(), pixels * 4).set(data.rgb);
         new Uint8Array(memory, core.bd_mask(), pixels).set(data.mask);
         new Float32Array(memory, core.bd_depth(), pixels).set(data.depth);
@@ -44,12 +49,13 @@ self.onmessage = async ({ data }) => {
             latestRaw = { frameId: data.frameId, skeleton: new Uint8Array(skeleton),
                 junctions: findRawJunctions(skeleton), linkLabels, linkCount };
         }
-        const junctionComparison = compareJunctionDepth(latestRaw.junctions, data.depth, data.mask);
+        const gapThreshold = data.gapThreshold ?? 0.15;
+        const junctionComparison = compareJunctionDepth(latestRaw.junctions, data.depth, data.mask, gapThreshold);
         const depthLinks = segmentLinksByJunctionDepth(latestRaw.junctions, junctionComparison,
-            latestRaw.skeleton, latestRaw.linkLabels, latestRaw.linkCount, data.depth, data.mask);
+            latestRaw.skeleton, latestRaw.linkLabels, latestRaw.linkCount, data.depth, data.mask, gapThreshold);
         const depthJunctionArmIds = latestRaw.junctions.map(junction => junction.armSeeds.map(seeds =>
             seeds.map(index => depthLinks.labels[index]).find(Boolean) ?? 0));
-        const pca = analyzePcaSegments(depthLinks.labels, data.mask, data.depth, data.intrinsics, data.rotation);
+        const pca = analyzePcaSegments(depthLinks.labels, data.mask, data.depth, data.intrinsics, data.rotation, 320, depthKind, gapThreshold);
         core.bd_run(data.intrinsics[0], data.intrinsics[1], data.intrinsics[2], data.intrinsics[3], data.worldUp);
         const count = core.bd_branch_count();
         const fields = core.bd_fields();
@@ -62,6 +68,7 @@ self.onmessage = async ({ data }) => {
                 relative_depth_consistency: b[7], center_px: [b[8], b[9]],
                 endpoints_px: [[b[10], b[11]], [b[12], b[13]]],
                 center_pseudo3d_world_axes: [b[14], b[15], b[16]],
+                center_world_axes: [b[14], b[15], b[16]],
                 mean_rgb: [b[17], b[18], b[19]],
                 vertical_alignment: b[20], orientation_confidence: b[21],
                 is_trunk: b[22] > 0.5, projected_up_alignment: b[23],
@@ -71,8 +78,11 @@ self.onmessage = async ({ data }) => {
         const junctions = Array.from(new Int16Array(memory, core.bd_junctions(), core.bd_junction_count() * 2));
         const instanceMask = new Uint8Array(new Uint8Array(memory, core.bd_labels(), pixels));
         const trunkIds = new Set(branches.filter(branch => branch.is_trunk).map(branch => branch.id));
+        const lengths = measureSkeletonLengths(latestRaw.skeleton, depthLinks.labels, data.mask, data.depth,
+            data.intrinsics, depthKind);
         const pcaById = new Map(pca.objects.map(object => {
             object.centerlineLengthPx = 0;
+            object.centerlineLengthCm = lengths.byLabel.get(object.id) ?? null;
             object.trunkCenterlineLengthPx = 0;
             object.detectorCenterlineLengthPx = 0;
             return [object.id, object];
@@ -96,15 +106,39 @@ self.onmessage = async ({ data }) => {
             if (assigned) object.detectorCenterlineLengthPx += 2;
             if (trunk && trunk * 2 >= assigned) object.trunkCenterlineLengthPx += 2;
         }
-        self.postMessage({ frameId: data.frameId, branches, junctions, instanceMask,
+        const detectorLabels = new Uint32Array(latestRaw.skeleton.length);
+        for (let i = 0; i < detectorLabels.length; i++) {
+            if (depthKind !== 'camera_z_m' || !latestRaw.skeleton[i]) continue;
+            const p = Math.floor(i / 320) * 1280 + (i % 320) * 2;
+            const counts = new Map();
+            for (const offset of pixelOffsets) {
+                const id = instanceMask[p + offset];
+                if (id && data.mask[p + offset]) counts.set(id, (counts.get(id) ?? 0) + 1);
+            }
+            detectorLabels[i] = [...counts].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0]?.[0] ?? 0;
+        }
+        const detectorLengths = measureSkeletonLengths(latestRaw.skeleton, detectorLabels, data.mask, data.depth,
+            data.intrinsics, depthKind);
+        for (const branch of branches) branch.centerline_length_cm = detectorLengths.byLabel.get(branch.id) ?? null;
+        const rawSkeleton = new Uint8Array(latestRaw.skeleton);
+        self.postMessage({ frameId: data.frameId, depthSource: data.depthSource,
+            analysisRevision: data.analysisRevision, requestId: data.requestId,
+            depthKind, branches, junctions, instanceMask,
+            rawSkeleton, rawSkeletonCount: rawSkeleton.reduce((sum, value) => sum + value, 0),
+            skeletonLengthCm: lengths.totalCm, metricLengthCoverage: lengths.validFraction,
+            linkLabels: latestRaw.linkLabels, linkCount: latestRaw.linkCount,
+            processedMask: prepared?.processedMask, boundary: prepared?.boundary, missing: prepared?.missing,
+            boundaryCells: prepared?.boundaryCells, missingCells: prepared?.missingCells,
+            validFraction: prepared?.validFraction,
             rawJunctions: rawJunctionMarkers(latestRaw.junctions), junctionComparison,
             depthLinkLabels: depthLinks.labels, depthLinkCount: depthLinks.count,
             depthLinkCuts: depthLinks.depthCuts, depthJunctionCuts: depthLinks.junctionCuts,
             depthJunctionArmIds,
             pcaObjects: pca.objects, pcaAdjacency: pca.adjacency,
-            cpu_ms: performance.now() - started, geometry_units: 'relative_pseudo3d',
+            cpu_ms: performance.now() - started, geometry_units: depthKind === 'camera_z_m' ? 'approximate_meters' : 'relative_pseudo3d',
             ranking: 'heuristic_candidate_only' }, [instanceMask.buffer, depthLinks.labels.buffer]);
     } catch (error) {
-        self.postMessage({ frameId: data.frameId, error: error.message });
+        self.postMessage({ frameId: data.frameId, depthSource: data.depthSource,
+            analysisRevision: data.analysisRevision, requestId: data.requestId, error: error.message });
     }
 };

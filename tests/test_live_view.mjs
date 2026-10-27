@@ -5,7 +5,16 @@ import ts from '../supersplat/node_modules/typescript/lib/typescript.js';
 
 const source = readFileSync(new URL('../supersplat/src/live-view-utils.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
-const { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32, numpyUint32 } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32, numpyUint32, parseBoxScaleReference } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+
+test('BBox scale reference is accepted only when it agrees with the applied 3DGS scale', () => {
+    const reference = { source:'bbox',box_id:'branch_001',axis:'X',scene_length:.25,actual_length_m:.5 };
+    assert.deepEqual(parseBoxScaleReference(JSON.parse(JSON.stringify(reference)),2),reference);
+    assert.equal(parseBoxScaleReference(reference,3),null);
+    assert.equal(parseBoxScaleReference({...reference,actual_length_m:0},2),null);
+    assert.equal(parseBoxScaleReference({...reference,axis:'Q'},2),null);
+    assert.equal(parseBoxScaleReference(reference,NaN),null);
+});
 
 test('640-square intrinsics preserve both full sensor fields of view', () => {
     const k = sensorIntrinsics();

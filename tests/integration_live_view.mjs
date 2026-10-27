@@ -104,7 +104,10 @@ try {
             const x=Math.min(639,Math.max(0,Math.round(uv.x*640))), y=Math.min(639,Math.max(0,Math.round(uv.y*640)));
             return {x,y,value:result.mask.getContext('2d').getImageData(x,y,1,1).data[0]};
         };
-        return {behind:at(window._qaPoints.bg),visible:at(window._qaPoints.side),pose:result.pose,depth:result.depth?.length,frame:result.frameId};
+        const gsIndex=result.gsDepth.findIndex(Number.isFinite);
+        return {behind:at(window._qaPoints.bg),visible:at(window._qaPoints.side),pose:result.pose,
+            depth:result.depth?.length,gsDepth:result.gsDepth?.length,gsIndex,
+            gsMeters:result.gsDepth[gsIndex],frame:result.frameId};
     })()`);
     console.log(JSON.stringify({configured, behind:occlusion.behind, visible:occlusion.visible, frame:occlusion.frame}));
     assert.equal(occlusion.behind.value, 0, 'foreground must occlude the annotated background');
@@ -113,6 +116,28 @@ try {
     assert.equal(occlusion.pose.frame_id, occlusion.frame);
     assert.equal(await evaluate('scene.events.invoke("annotation.liveSnapshot").detection.frameId'), occlusion.frame);
     assert.ok(Math.abs(occlusion.pose.camera_profile.horizontal_fov_degrees - 118) < 1e-9);
+    assert.equal(occlusion.gsDepth, 640 * 640);
+    assert.ok(occlusion.gsIndex >= 0 && occlusion.gsMeters > 0, '3DGS depth map must contain a visible metric depth');
+    assert.match(occlusion.pose.gs_depth.model, /3DGS/);
+    const boxScale = await evaluate(`(() => {
+        const panel=scene.events.invoke('annotation.panel');
+        const oldScale=panel.metersPerSceneUnit;
+        const oldSize=panel.box.size[0];
+        panel.boxCalibrationAxis.value='0';
+        panel.boxCalibrationMetersInput.value=String(panel.box.size[0]*oldScale*2);
+        panel.applyBoxScaleCalibration();
+        return {oldScale,newScale:panel.metersPerSceneUnit,oldSize,boxSize:panel.box.size[0],
+            urlScale:Number(new URL(location.href).searchParams.get('metersPerSceneUnit'))};
+    })()`);
+    assert.ok(Math.abs(boxScale.newScale / boxScale.oldScale - 2) < 1e-6);
+    assert.equal(boxScale.boxSize, boxScale.oldSize, 'scale calibration must not resize the BBox');
+    assert.equal(boxScale.urlScale, boxScale.newScale, 'the calibrated scale must survive reload via the URL');
+    await waitFor(`document.querySelector('.live-view')?.dataset.state === 'ready' && scene.events.invoke('annotation.liveSnapshot')?.pose.gs_depth.meters_per_scene_unit > ${boxScale.oldScale * 1.5}`);
+    const calibratedDepth = await evaluate(`scene.events.invoke('annotation.liveSnapshot').gsDepth[${occlusion.gsIndex}]`);
+    assert.ok(Math.abs(calibratedDepth / occlusion.gsMeters - 2) < 0.01,
+        'the same 3DGS pixel depth must follow the BBox scale');
+    await evaluate(`scene.events.invoke('annotation.panel').setMetersPerSceneUnit(${boxScale.oldScale}, 'qa reset')`);
+    await waitFor(`document.querySelector('.live-view')?.dataset.state === 'ready' && scene.events.invoke('annotation.liveSnapshot')?.pose.gs_depth.meters_per_scene_unit < ${boxScale.oldScale * 1.5}`);
     const oriented = await evaluate(`(async () => {
         const live=scene.events.invoke('annotation.panel').liveView;
         const snapshot=scene.events.invoke('annotation.liveSnapshot');
@@ -228,8 +253,9 @@ try {
         return true;
     })()`);
     await evaluate(`window.scene.events.invoke('annotation.panel').liveView.save()`);
-    await waitFor('window._qaFiles.length === 10');
+    await waitFor('window._qaFiles.length === 12');
     const files = await evaluate('window._qaFiles');
+    assert.ok(files.some(file => file.path.endsWith('_3dgs_m.npy')));
     for (const file of files) {
         const filename = path.join('/tmp/annotation_live_export_qa', file.path);
         await mkdir(path.dirname(filename), { recursive: true });
@@ -296,6 +322,8 @@ try {
 
     const djiLinks = await evaluate(`(() => {
         const live=scene.events.invoke('annotation.panel').liveView,snapshot=scene.events.invoke('annotation.liveSnapshot');
+        live.comparisonView.overlaySource='da2';
+        live.drawJunctionComparison(snapshot);live.drawPcaPanel(snapshot);
         const mask=snapshot.mask.getContext('2d').getImageData(0,0,640,640).data;
         const left=snapshot.linkOverlay.getContext('2d').getImageData(0,0,640,640).data;
         const right=snapshot.depthLinkOverlay.getContext('2d').getImageData(0,0,640,640).data;
@@ -384,11 +412,21 @@ try {
             const source=s.detection.depthLinkLabels[i],kept=s.gravityMergedLabels[i];
             if(source&&!eligible.has(source)){removedPixels++;if(kept)incorrectPixels++;}
         }
+        const component=live.gravityComponentCheckbox;
+        component.checked=true;component.dispatchEvent(new Event('change',{bubbles:true}));
+        let strictIncorrect=0;
+        for(let i=0;i<s.detection.depthLinkLabels.length;i++){
+            const source=s.detection.depthLinkLabels[i];
+            if(source&&!eligible.has(source)&&s.gravityMergedLabels[i])strictIncorrect++;
+        }
+        const strictObjects=s.gravityMergedObjects.length;
+        component.checked=false;component.dispatchEvent(new Event('change',{bubbles:true}));
         const angleError=Math.max(0,...objects.filter(o=>o.reliable).map(o=>Math.abs(
             o.angleToGravityDeg-Math.acos(Math.min(1,Math.abs(o.axis[up])))*180/Math.PI)));
         const before={frame:s.frameId,up:s.pose.world_up_axis,tolerance:live.gravityTolerance,
             merged:s.pcaMergedCount,objects:objects.length,reliable:objects.filter(o=>o.reliable).length,
             eligible:s.gravityEligibleCount,expectedEligible:eligible.size,removedPixels,incorrectPixels,
+            strictIncorrect,strictObjects,componentChecked:component.checked,
             selected:new Set(s.gravityFilteredLabels).size-1,
             minLength:live.minGravityLength,excludeTrunks:live.excludeGravityTrunks,
             trunkObjects:objects.filter(o=>o.isTrunk).length,
@@ -420,7 +458,8 @@ try {
         length.value='12';length.dispatchEvent(new Event('input',{bubbles:true}));
         slider.value='20';slider.dispatchEvent(new Event('input',{bubbles:true}));
         const kept=new Set(s.gravityFilteredLabels);kept.delete(0);
-        const expected=objects.filter(o=>o.reliable && 90-o.angleToGravityDeg<=20 &&
+        const expected=objects.filter(o=>o.reliable && (90-o.angleToGravityDeg<=20 ||
+            o.memberIds.some(id=>eligible.has(id))) &&
             o.centerlineLengthPx>=12).map(o=>o.id);
         return {...before,atZero,atNinety,atNinetyReliable,atNinetyEligible,atLong,colored,outside,
             withoutTrunkIds:[...withoutTrunks].sort((a,b)=>a-b),
@@ -433,11 +472,14 @@ try {
     })()`);
     assert.equal(gravity.tolerance,20);
     assert.equal(gravity.up,'z');
-    assert.ok(gravity.objects<=gravity.eligible);
+    assert.equal(gravity.objects,pca.output);
     assert.ok(gravity.reliable>0 && gravity.angleError<1e-8);
     assert.equal(gravity.eligible,gravity.expectedEligible);
     assert.ok(gravity.removedPixels>0);
-    assert.equal(gravity.incorrectPixels,0,'excluded source components must not enter merged objects');
+    assert.equal(gravity.incorrectPixels,gravity.removedPixels,'relaxed mode retains components in merged objects');
+    assert.equal(gravity.strictIncorrect,0,'strict mode removes tilted source components');
+    assert.ok(gravity.strictObjects<gravity.objects);
+    assert.equal(gravity.componentChecked,false);
     assert.ok(gravity.atZero<=gravity.selected && gravity.selected<=gravity.atNinety);
     assert.equal(gravity.atNinety,gravity.atNinetyReliable);
     assert.equal(gravity.atNinetyEligible,pca.reliable);
@@ -454,7 +496,7 @@ try {
     assert.equal(gravity.minLength,12);
     assert.equal(gravity.excludeTrunks,false);
     assert.equal(gravity.sixthPanelUnchanged,true);
-    assert.match(gravity.inputLabel,/Component gate/);
+    assert.match(gravity.inputLabel,/PCA merged/);
     assert.match(gravity.outputLabel,/Near-horizontal/);
     console.log(JSON.stringify({djiGravity:gravity}));
     const final = await evaluate(`(() => {
@@ -479,6 +521,19 @@ try {
             lowHeightRejected:original.results.filter(c=>c.reasons.includes('low_height')).length,
             cpuMs:s.finalLandingCpuMs,
             gravity:s.pose.gravity};
+        const rejected=original.results.find(c=>c.woody_area_px>=6&&c.reasons.length);
+        const crop=live.comparisonCrop(s),hoverTile=live.comparisonView.tiles.get('da2:final'),rect=hoverTile.canvas.getBoundingClientRect();
+        const hoverIndex=s.detection.depthLinkLabels.findIndex((id,i)=>id===rejected?.id&&
+            (i%320)*2+1>=crop.x&&(i%320)*2+1<crop.x+crop.size&&
+            Math.floor(i/320)*2+1>=crop.y&&Math.floor(i/320)*2+1<crop.y+crop.size);
+        if(hoverIndex>=0){
+            const x=(hoverIndex%320)*2+1,y=Math.floor(hoverIndex/320)*2+1;
+            hoverTile.canvas.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,
+                clientX:rect.left+(x-crop.x)/crop.size*rect.width,
+                clientY:rect.top+(y-crop.y)/crop.size*rect.height}));
+        }
+        const rejectionDiagnostic=hoverTile.caption.textContent;
+        hoverTile.canvas.dispatchEvent(new MouseEvent('mouseleave'));
         const bearing=live.finalBearingSlider,endOn=live.finalEndOnSlider,tilt=live.finalImageTiltSlider;
         const strict=live.finalStrictCameraCheckbox;
         strict.checked=true;strict.dispatchEvent(new Event('change',{bubbles:true}));
@@ -492,6 +547,14 @@ try {
         endOn.value='30';endOn.dispatchEvent(new Event('input',{bubbles:true}));
         tilt.value='30';tilt.dispatchEvent(new Event('input',{bubbles:true}));
         strict.checked=false;strict.dispatchEvent(new Event('change',{bubbles:true}));
+        const height=live.finalHeightSlider;
+        height.value='0.25';height.dispatchEvent(new Event('input',{bubbles:true}));
+        const strictHeightSelected=s.finalLanding.selected.map(c=>c.id);
+        height.value='0.1';height.dispatchEvent(new Event('input',{bubbles:true}));
+        const inliers=live.finalCylinderInlierSlider;
+        inliers.value='0.65';inliers.dispatchEvent(new Event('input',{bubbles:true}));
+        const strictCylinderSelected=s.finalLanding.selected.map(c=>c.id);
+        inliers.value='0.4';inliers.dispatchEvent(new Event('input',{bubbles:true}));
         const width=live.finalWidthSlider;width.value='4';width.dispatchEvent(new Event('input',{bubbles:true}));
         const narrow=s.finalLanding.selected.length;
         width.value='24';width.dispatchEvent(new Event('input',{bubbles:true}));
@@ -504,6 +567,7 @@ try {
         const imu={...s.pose.gravity};
         scene.events.invoke('annotation.setImuGravity',null);
         return {...before,strictSelected,screenTiltRejected,allNinety,
+            strictHeightSelected,strictCylinderSelected,rejectionDiagnostic,rejectedId:rejected?.id,
             narrow,topOne,restored:s.finalLanding.selected.map(c=>c.id),imu,expected,
             sameFrame:s===scene.events.invoke('annotation.liveSnapshot')};
     })()`);
@@ -512,7 +576,11 @@ try {
     assert.equal(final.wrongSource,0);
     assert.equal(final.greenSelected,0);
     assert.ok(final.selectedPixels>0);
+    assert.ok(final.selected.length>0,'depth-aware topology must retain eligible branches without assuming source-local IDs');
+    assert.ok(final.rejectionDiagnostic.includes(`ID ${final.rejectedId} ·`));
     assert.ok(final.strictSelected.length<final.selected.length);
+    assert.ok(final.strictHeightSelected.length<final.selected.length);
+    assert.ok(final.strictCylinderSelected.length<final.selected.length);
     assert.ok(final.allNinety.length>=final.selected.length);
     assert.ok(final.screenTiltRejected>0);
     assert.ok(final.lowHeightRejected>0);
@@ -538,13 +606,13 @@ try {
     assert.match(finalMain.title,/Final landing segmentation/);
     assert.equal(finalMain.overlay,finalMain.selected?'visible':'hidden');
     assert.equal(finalMain.frame,final.frame);
-    await evaluate(`document.querySelector('.live-final-tile').scrollIntoView({block:'center'})`);
+    await evaluate(`document.querySelector('.compare-final').scrollIntoView({block:'center'})`);
     const finalShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
     await writeFile('/tmp/annotation_live_dji_final_qa.png', Buffer.from(finalShot.data, 'base64'));
-    await evaluate(`document.querySelector('.live-gravity-tile').scrollIntoView({block:'center'})`);
+    await evaluate(`document.querySelector('.compare-gravity').scrollIntoView({block:'center'})`);
     const gravityShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
     await writeFile('/tmp/annotation_live_dji_gravity_qa.png', Buffer.from(gravityShot.data, 'base64'));
-    await evaluate(`document.querySelector('.live-pca-tile').scrollIntoView({block:'center'})`);
+    await evaluate(`document.querySelector('.compare-pca').scrollIntoView({block:'center'})`);
     const pcaShot = await cdp.send('Page.captureScreenshot', { format: 'png' });
     await writeFile('/tmp/annotation_live_dji_pca_qa.png', Buffer.from(pcaShot.data, 'base64'));
     await evaluate(`document.querySelector('.live-junction-tile').scrollIntoView({block:'center'})`);
@@ -585,7 +653,7 @@ try {
     assert.match(djiRaw.depthLabel,/With DA2/);
     assert.match(djiRaw.title,/Raw skeleton/);
     assert.equal(djiRaw.topKVisible,'none');
-    assert.equal(djiRaw.overlay,'hidden');
+    assert.equal(djiRaw.overlay,'visible','the selected source skeleton is also shown on the main view');
     console.log(JSON.stringify({djiJunctions:{count:djiRaw.junctions,statuses:djiRaw.junctionStatuses}}));
     await evaluate(`(() => {const tile=document.querySelector('.live-junction-tile');
         tile.scrollIntoView({block:'center'});return tile.getBoundingClientRect().top;})()`);
@@ -607,6 +675,7 @@ try {
         const full=panel.getBoundingClientRect();
         const visibleMaximized=getComputedStyle(topK.parentElement).display;
         const live=scene.events.invoke('annotation.panel').liveView;
+        live.comparisonView.root.querySelector('details').open=true;
         const pcaControl=live.pcaAngleSlider.getBoundingClientRect();
         const gravityControl=live.gravityAngleSlider.getBoundingClientRect();
         const gravityLengthControl=live.gravityLengthSlider.getBoundingClientRect();
@@ -787,7 +856,7 @@ try {
         return true;
     })()`);
     await evaluate(`window.scene.events.invoke('annotation.panel').liveView.save()`);
-    await waitFor('window._qaFiles.length === 10');
+    await waitFor('window._qaFiles.length === 12');
     const djiFiles = await evaluate('window._qaFiles');
     const detectionFile = djiFiles.find(file => file.path.startsWith('Branches/') && file.path.endsWith('.json'));
     const savedDetection = JSON.parse(Buffer.from(detectionFile.base64,'base64').toString('utf8'));
