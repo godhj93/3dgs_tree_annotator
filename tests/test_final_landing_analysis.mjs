@@ -49,6 +49,11 @@ test('final mask keeps only slender passing objects inside visible annotation', 
     const strict = segmentFinalLanding({ labels, objects, mask, depth, rgb, pose,
         settings: { ...settings, minLinearity: 0.95 } });
     assert.equal(strict.selected.length, 0);
+    const optional = segmentFinalLanding({ labels, objects, mask, depth, rgb, pose,
+        settings: {...settings, filterShape: false, filterMinLength: false, filterGravity: false,
+            filterDepthSpread: false, filterRelativeHeight: false, rejectFoliage: false, excludeTrunks: false, topK: null} });
+    assert.deepEqual(optional.selected.map(candidate => candidate.id).sort(), [1, 2]);
+    assert.equal(optional.ids[80 * 640 + 80], 2);
 });
 
 test('a merged Y stays two cylindrical link IDs and green pine foliage is removed', () => {

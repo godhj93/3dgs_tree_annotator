@@ -152,7 +152,7 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
         }
     });
 
-    events.function('render.annotationSnapshot', async (width: number, height: number) => {
+    events.function('render.annotationSnapshot', async (width: number, height: number, syncSort = false) => {
         const camera = scene.camera;
         if (camera.targetSizeOverride || scene.lockedRenderMode) throw new Error('Another capture is running');
         const savedOverride = camera.poseOverride;
@@ -166,6 +166,33 @@ const registerRenderEvents = (scene: Scene, events: Events) => {
             camera.renderOverlays = false;
             scene.gizmoLayer.enabled = false;
             camera.startOffscreenMode(width, height);
+            if (syncSort) {
+                const splats = (scene.getElementsByType(ElementType.splat) as Splat[]).filter(splat => splat.visible);
+                await Promise.all(splats.map(splat => {
+                    const { instance } = splat.entity.gsplat;
+                    return new Promise<void>((resolve, reject) => {
+                        const previousPosition = instance.lastCameraPosition.clone();
+                        const previousDirection = instance.lastCameraDirection.clone();
+                        const handle = instance.sorter.once('updated', () => {
+                            clearTimeout(timer);
+                            instance.update();
+                            resolve();
+                        });
+                        const timer = setTimeout(() => {
+                            handle.off();
+                            reject(new Error('Gaussian ordering did not settle for the capture pose'));
+                        }, 5000);
+                        instance.sort(camera.mainCamera);
+                        if (previousPosition.equals(instance.lastCameraPosition) &&
+                            previousDirection.equals(instance.lastCameraDirection)) {
+                            clearTimeout(timer);
+                            handle.off();
+                            instance.update();
+                            resolve();
+                        }
+                    });
+                }));
+            }
             const rendered = new Promise<void>((resolve, reject) => {
                 const timer = setTimeout(() => {
                     handle.off();

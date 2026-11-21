@@ -3,8 +3,8 @@ import { Color, Mat4, Ray, Vec3 } from 'playcanvas';
 import { ElementType } from './element';
 import { Events } from './events';
 import { LiveView } from './live-view';
-import { parseBoxScaleReference } from './live-view-utils';
-import type { BoxScaleReference } from './live-view-utils';
+import { parseBoxScaleReference, parseHeightScaleReference } from './live-view-utils';
+import type { BoxScaleReference, HeightScaleReference } from './live-view-utils';
 import { Scene } from './scene';
 import { Splat } from './splat';
 import { State } from './splat-state';
@@ -328,6 +328,7 @@ class BBoxAnnotation {
     drawDepth = 0.1;
     metersPerSceneUnit = 1;
     boxScaleReference: BoxScaleReference | null = null;
+    heightScaleReference: HeightScaleReference | null = null;
     boxCalibrationEditingId = '';
     metricScalePinnedByUrl = false;
     metricInput: HTMLInputElement;
@@ -376,6 +377,7 @@ class BBoxAnnotation {
                 boxes,
                 metersPerSceneUnit: this.metersPerSceneUnit,
                 scaleReference: this.boxScaleReference,
+                heightReference: this.heightScaleReference,
                 contains: (point: Vec3) => this.pointInSegmentationBoxes(point, include, exclude)
             };
         }, () => this.outputDirHandle, () => this.chooseOutputFolder(),
@@ -409,7 +411,8 @@ class BBoxAnnotation {
         events.function('annotation.boxes3d', () => this.boxes.map(box => cloneBox(box)));
         events.function('metric.metersPerSceneUnit', () => this.metersPerSceneUnit);
         events.function('metric.sceneUnitsPerMeter', () => 1 / Math.max(this.metersPerSceneUnit, 1e-9));
-        events.on('metric.scale.set', (value: number, source = 'external') => {
+        events.on('metric.scale.set', (value: number, source = 'external', reference: any = null) => {
+            this.heightScaleReference = source === 'height calibration' ? parseHeightScaleReference(reference, value) : null;
             this.setMetersPerSceneUnit(value, source);
         });
         events.on('measure.length.changed', (sceneLength: number, metersLength: number) => {
@@ -459,6 +462,9 @@ class BBoxAnnotation {
             this.metersPerSceneUnit = stored;
         }
         try {
+            this.heightScaleReference = parseHeightScaleReference(JSON.parse(url.searchParams.get('heightReference') ?? 'null'), this.metersPerSceneUnit);
+        } catch { this.heightScaleReference = null; }
+        try {
             this.boxScaleReference = parseBoxScaleReference(JSON.parse(url.searchParams.get('scaleReference') ?? 'null'), this.metersPerSceneUnit);
         } catch { this.boxScaleReference = null; }
     }
@@ -495,9 +501,10 @@ class BBoxAnnotation {
         const randomOuterRadius = this.randomOuterRadiusInput ? this.randomOuterRadiusScene() : null;
         const randomInnerCylinder = this.randomInnerCylinderInput ? this.randomInnerCylinderScene() : null;
         this.metersPerSceneUnit = value;
+        if (source !== 'height calibration' && source !== 'height import') this.heightScaleReference = null;
         if (!source.startsWith('BBox ')) this.boxScaleReference = null;
         localStorage.setItem(metricStorageKey, `${value}`);
-        if (source === 'calibration' || source === 'manual input' || source.startsWith('BBox ')) {
+        if (source === 'calibration' || source === 'manual input' || source === 'height calibration' || source === 'measure-tool' || source.startsWith('BBox ')) {
             const url = new URL(window.location.href);
             url.searchParams.delete('metricScale');
             url.searchParams.delete('metric-scale');
@@ -507,6 +514,8 @@ class BBoxAnnotation {
             url.searchParams.set('metersPerSceneUnit', `${value}`);
             if (this.boxScaleReference) url.searchParams.set('scaleReference', JSON.stringify(this.boxScaleReference));
             else url.searchParams.delete('scaleReference');
+            if (this.heightScaleReference) url.searchParams.set('heightReference', JSON.stringify(this.heightScaleReference));
+            else url.searchParams.delete('heightReference');
             window.history.replaceState(window.history.state, '', url);
             this.metricScalePinnedByUrl = true;
         }
@@ -1617,13 +1626,16 @@ class BBoxAnnotation {
         );
 
         const losExportActions = document.createElement('div');
-        losExportActions.className = 'bbox-row two';
+        losExportActions.className = 'bbox-row three';
         losExportActions.append(
             this.button('Choose Output Folder', () => {
                 this.chooseOutputFolder().catch(err => this.segmentMessage(`output folder error: ${err.message ?? err}`));
             }),
             this.button('Run LOS Path', () => {
                 this.runLosPathExport().catch(err => this.segmentMessage(`LOS path error: ${err.message ?? err}`));
+            }),
+            this.button('Export Tree Dataset', () => {
+                this.runLosPathExport(true).catch(err => this.segmentMessage(`Tree dataset error: ${err.message ?? err}`));
             })
         );
 
@@ -3111,6 +3123,7 @@ class BBoxAnnotation {
             metric_scale: {
                 meters_per_scene_unit: this.metersPerSceneUnit,
                 reference: this.boxScaleReference,
+                height_reference: this.heightScaleReference,
                 scene_units_per_meter: 1 / Math.max(this.metersPerSceneUnit, 1e-9)
             },
             boxes: this.boxes.map((box, index) => {
@@ -3244,6 +3257,7 @@ class BBoxAnnotation {
         }
         if (!this.metricScalePinnedByUrl) {
             this.boxScaleReference = parseBoxScaleReference(payload?.metric_scale?.reference, this.metersPerSceneUnit);
+            this.heightScaleReference = parseHeightScaleReference(payload?.metric_scale?.height_reference, this.metersPerSceneUnit);
             this.writeMetricInputs();
         }
         this.boxes = imported.map(entry => cloneBox(entry.box));
@@ -3961,7 +3975,13 @@ class BBoxAnnotation {
         return `los_${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}_${two(now.getHours())}${two(now.getMinutes())}${two(now.getSeconds())}_${three(now.getMilliseconds())}`;
     }
 
-    async runLosPathExport() {
+    async runLosPathExport(treeDataset = false, approach?: {
+        runId: string;
+        split?: 'train' | 'val' | 'test';
+        azimuthDeg: number;
+        elevationDeg: number;
+        sector: number;
+    }) {
         if (this.spiralRunning) {
             this.spiralRunning = false;
             this.segmentMessage('LOS path: stopping after current view...');
@@ -3972,17 +3992,23 @@ class BBoxAnnotation {
         }
 
         this.readInputs();
+        const treeSource = treeDataset ? this.liveView.getSource() : null;
+        if (treeSource && (!treeSource.splat || !treeSource.heightReference ||
+            !treeSource.boxes.some(box => box.operation !== 'exclude'))) {
+            throw new Error('Load a 3DGS scene, include BBox and calibrated tree height before exporting a dataset');
+        }
         if (!this.outputDirHandle && (window as any).showDirectoryPicker) {
             await this.chooseOutputFolder();
         }
 
         const dirHandle = this.outputDirHandle;
+        if (treeDataset && !dirHandle) throw new Error('Choose a writable dataset folder');
         const target = this.spiralCenter();
         const targetMeters = [this.sceneToMeters(target.x), this.sceneToMeters(target.y), this.sceneToMeters(target.z)];
         const waypoints = this.losWaypoints.map(point => point.clone());
         const steps = this.losStepsPerSegment();
         const totalViews = (waypoints.length - 1) * steps + 1;
-        const runId = this.losRunId();
+        const runId = approach?.runId ?? this.losRunId();
         const minTargetDistance = Math.max(this.sceneExtent() * 1e-6, 1e-7);
 
         waypoints.forEach((point, index) => {
@@ -4017,10 +4043,29 @@ class BBoxAnnotation {
             boxes: this.payload().boxes,
             views: []
         };
+        let treeFolders: Record<string, any>;
+        if (treeSource) {
+            const url = new URL(window.location.href);
+            const sceneName = treeSource.splat.name.replaceAll('\\', '/').split('?')[0].split('/').at(-1);
+            const sceneId = url.searchParams.get('sceneId')?.trim() || sceneName;
+            Object.assign(manifest, { schema: 'tree-mask-dataset/v1', source: '3dgs_render', renderer: 'playcanvas',
+                scene_id: sceneId, bbox_source: url.searchParams.get('boxes3d'),
+                metric_scale: this.payload().metric_scale });
+            if (approach) {
+                manifest.approach = { azimuth_deg: approach.azimuthDeg, elevation_deg: approach.elevationDeg, sector: approach.sector };
+                if (approach.split) manifest.assigned_split = approach.split;
+            }
+        }
 
         this.spiralRunning = true;
         let viewIndex = 0;
         try {
+            if (treeSource) {
+                treeFolders = {};
+                for (const name of ['RGB', 'Mask', 'Pose', 'Depth', 'SensorRGB']) {
+                    treeFolders[name] = await dirHandle.getDirectoryHandle(name, { create: true });
+                }
+            }
             for (let segmentIndex = 0; segmentIndex < waypoints.length - 1; segmentIndex++) {
                 const start = waypoints[segmentIndex];
                 const end = waypoints[segmentIndex + 1];
@@ -4039,7 +4084,30 @@ class BBoxAnnotation {
 
                     const prefix = `${runId}_${String(viewIndex).padStart(4, '0')}`;
                     this.segmentMessage(`LOS path: ${viewIndex + 1}/${totalViews} · segment ${segmentIndex + 1} · t=${t.toFixed(3)}`);
-                    const result = await this.captureViewSet(prefix, dirHandle);
+                    let result;
+                    let distanceM: number | undefined;
+                    if (treeSource) {
+                        this.scene.camera.onUpdate(0);
+                        const frame = await this.liveView.captureTreeFrame(treeSource, prefix);
+                        if (approach) {
+                            const [x, y, z] = frame.pose.position;
+                            distanceM = this.sceneToMeters(Math.hypot(x - target.x, y - target.y, z - target.z));
+                            frame.pose.approach = { ...manifest.approach, distance_m: distanceM, target_world_m: targetMeters };
+                        }
+                        const files = { rgb: `RGB/${prefix}.png`, gt_mask: `Mask/${prefix}.png`,
+                            pose: `Pose/${prefix}.json`, reference_depth: `Depth/${prefix}_3dgs_m.npy`,
+                            sensor_rgb: `SensorRGB/${prefix}.png` };
+                        await Promise.all([
+                            this.writeBlobFile(`${prefix}.png`, frame.rgb, treeFolders.RGB),
+                            this.writeBlobFile(`${prefix}.png`, frame.mask, treeFolders.Mask),
+                            this.writeTextFile(`${prefix}.json`, JSON.stringify(frame.pose, null, 2), treeFolders.Pose),
+                            this.writeBlobFile(`${prefix}_3dgs_m.npy`, frame.depth, treeFolders.Depth),
+                            this.writeBlobFile(`${prefix}.png`, frame.sensorRgb, treeFolders.SensorRGB)
+                        ]);
+                        result = { frame_id: prefix, width: 640, height: 640, files };
+                    } else {
+                        result = await this.captureViewSet(prefix, dirHandle);
+                    }
                     manifest.views.push({
                         index: viewIndex,
                         prefix,
@@ -4050,6 +4118,7 @@ class BBoxAnnotation {
                         camera_position_scene: [position.x, position.y, position.z],
                         target: targetMeters,
                         target_scene: [target.x, target.y, target.z],
+                        distance_to_target_m: distanceM,
                         result
                     });
                     viewIndex++;

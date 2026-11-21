@@ -13,12 +13,17 @@ import { Splat } from './splat';
 import { State } from './splat-state';
 import { resolveGravityWorld, segmentFinalLanding } from './final-landing-analysis.mjs';
 import type { GravitySample, FinalLandingResult } from './final-landing-analysis.mjs';
+import { birdBoxBounds, buildSpaceScene, cornerMinHitPixels, cornerProbeRadiusM, defaultBirdSpace, evaluateLandingSpace, selectSpaceCandidates } from '../static/lib/branch-detector/landing-space-analysis.mjs';
+import type { Da2SpaceCalibration, SpaceAssessment } from '../static/lib/branch-detector/landing-space-analysis.mjs';
+import { LandingSpaceClient } from './landing-space-client';
+import { describeSpace, drawSpaceBox, projectSpacePoint, summarizeSpaceRejections } from './landing-space-view';
 
 type AnnotationSource = {
     splat: Splat | null;
     boxes: any[];
     metersPerSceneUnit: number;
     scaleReference?: BoxScaleReference | null;
+    heightReference?: any;
     contains: (point: Vec3) => boolean;
 };
 
@@ -72,8 +77,25 @@ type LiveSnapshot = {
     finalLandingKey?: string;
     finalLandingOverlay?: HTMLCanvasElement;
     finalLandingCpuMs?: number;
+    finalBase?: FinalLandingResult;
+    spaceKey?: string;
+    spacePending?: boolean;
+    spaceCpuMs?: number;
+    spaceCalibration?: Da2SpaceCalibration | null;
     comparisonCrop?: { x: number; y: number; size: number };
     detection?: BranchDetection;
+};
+
+type TreeEvaluationFrame = {
+    frameId: string;
+    rgb: HTMLCanvasElement;
+    gtMask: HTMLCanvasElement;
+    predictionMask: HTMLCanvasElement;
+    pose: LiveSnapshot['pose'];
+    da2Depth: Float32Array;
+    calibrationDepth?: Float32Array;
+    skipSpace?: boolean;
+    includeStages?: boolean;
 };
 
 type JunctionMarker = { x: number; y: number; armCount: number };
@@ -221,6 +243,28 @@ const finalLandingCanvas = (ids: Uint32Array) => {
     return pixelCanvas(pixels, 640, 640);
 };
 
+const landingCandidateIds = (result: FinalLandingResult, candidates: FinalLandingResult['eligible']) => {
+    const ids = new Uint32Array(result.ids.length);
+    for (const { id } of candidates) {
+        for (const pixel of result.candidatePixels.get(id) ?? []) {
+            ids[pixel] = id;
+        }
+    }
+    return ids;
+};
+
+const clearLandingDisplays = new WeakMap<FinalLandingResult, { result: FinalLandingResult; overlay: HTMLCanvasElement }>();
+const eligibleLandingCanvases = new WeakMap<FinalLandingResult, HTMLCanvasElement>();
+const eligibleLandingCanvas = (result: FinalLandingResult, selectedOverlay?: HTMLCanvasElement) => {
+    if (selectedOverlay && result.eligible.length === result.selected.length) return selectedOverlay;
+    let canvas = eligibleLandingCanvases.get(result);
+    if (!canvas) {
+        canvas = finalLandingCanvas(landingCandidateIds(result, result.eligible));
+        eligibleLandingCanvases.set(result, canvas);
+    }
+    return canvas;
+};
+
 const principalAxisFromMoments = (pixels: number, sum: number[], outer: number[]) => {
     if (!pixels) return { axis: [1, 0, 0], linearity: 0, reliable: false };
     const center = sum.map(value => value / pixels);
@@ -318,7 +362,7 @@ class LiveView {
     analysisCancel: Partial<Record<DepthSource, () => void>> = {};
     comparisonDifferenceOverlay: HTMLCanvasElement | null = null;
     imuGravity: GravitySample | null = null;
-    excludeTrunk = false;
+    excludeTrunk = true;
     horizontalAngle = 25;
     minBranchLength = 12;
     minLengthWidthRatio = 1.5;
@@ -327,11 +371,16 @@ class LiveView {
     showMainLanding = true;
     showJunctions = false;
     pcaMaxAngle = 20;
+    filterGravityAngle = true;
+    filterGravityLength = true;
     gravityTolerance = 20;
     minGravityLength = 12;
     minSkeletonLengthCm = 10;
-    requireGravityComponents = false;
-    excludeGravityTrunks = false;
+    requireGravityComponents = true;
+    excludeGravityTrunks = true;
+    filterLandingShape = true;
+    filterLandingDepthSpread = true;
+    filterLandingRelativeHeight = true;
     finalMaxWidthPx = 24;
     finalMinLinearity = 0.5;
     finalMinProjectedLinearity = 0.6;
@@ -341,10 +390,15 @@ class LiveView {
     finalMinWoodyFraction = 0.25;
     finalRejectFoliage = true;
     finalMaxCenterBearing = 30;
-    finalMaxEndOn = 30;
+    finalMaxEndOn = 90;
     finalMaxImageTilt = 30;
-    finalStrictCameraAngles = false;
+    finalStrictCameraAngles = true;
+    limitFinalTopK = true;
     finalTopK = 3;
+    birdSpace = { ...defaultBirdSpace };
+    da2SpaceReferenceM: number | null = null;
+    spaceClient = new LandingSpaceClient();
+    spaceInspectIds: Partial<Record<DepthSource, number>> = {};
     viewMode: 'raw' | 'candidates' | 'final' = 'raw';
     showYellowSegmentation = true;
     mainOverlay: HTMLCanvasElement;
@@ -394,6 +448,7 @@ class LiveView {
         events.function('annotation.membershipTexture', (splat: Splat) => (splat === this.memberSplat ? this.memberTexture : null));
         events.function('annotation.showSegmentationTint', () => this.showYellowSegmentation);
         events.function('annotation.liveSnapshot', () => this.last);
+        events.function('annotation.evaluateTreeFrame', (frame: TreeEvaluationFrame) => this.evaluateTreeFrame(frame));
         events.function('annotation.setImuGravity', (sample: GravitySample | null) => {
             if (sample) resolveGravityWorld(sample, { world_up_axis: 'z',
                 camera_to_world: [[1, 0, 0], [0, 1, 0], [0, 0, 1]] });
@@ -457,9 +512,24 @@ class LiveView {
             .live-junction-view canvas { display:block; width:100%; height:auto; aspect-ratio:1; }
             .live-junction-label { min-height:27px; padding:4px 1px; color:#cddce8; font-size:10px; }
             .live-junction-summary { padding:1px 7px 7px; color:#a9bfd0; font-size:10px; line-height:1.35; }
+            .live-space-title { margin:0; font-size:12px; }
+            .live-space-heading { padding-bottom:4px; color:#e2eff8; font-size:11px; font-weight:600; }
             .live-pca-controls { display:flex; align-items:center; gap:7px; flex-wrap:wrap; padding:4px 7px; color:#d9eaf4; font-size:11px; }
             .live-pca-controls input[type="range"] { flex:1 1 125px; min-width:100px; accent-color:#55dce9; }
-            .live-pca-controls input[type="number"] { width:58px; padding:3px; box-sizing:border-box; border:1px solid #52677d; border-radius:3px; background:#101d2b; color:#e6f4ff; }
+            .live-pca-controls input[type="number"], .live-space-parameters input { width:58px; padding:3px; box-sizing:border-box; border:1px solid #52677d; border-radius:3px; background:#101d2b; color:#e6f4ff; }
+            .live-stage-settings { min-width:0; margin:5px 6px 7px; padding:6px 7px; border:1px solid #344758; border-radius:4px; color:#d9eaf4; font-size:11px; }
+            .live-stage-settings summary { cursor:pointer; }
+            .live-stage-settings legend, .live-stage-settings summary { color:#a9e7ff; font-weight:600; }
+            .live-stage-sliders { display:grid; gap:5px; margin-top:8px; }
+            .live-stage-slider { display:grid; grid-template-columns:minmax(0,1fr) minmax(50px,1fr) 36px; align-items:center; gap:6px; }
+            .live-stage-slider input { min-width:0; width:100%; margin:0; accent-color:#55dce9; }
+            .live-stage-slider span:last-child { text-align:right; }
+            .live-space-parameters { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,108px),1fr)); gap:6px 9px; margin-top:7px; }
+            .live-space-parameters label { display:flex; flex-direction:column; min-width:0; gap:3px; }
+            .live-space-parameters input { width:100%; }
+            .live-space-options { margin-top:8px; }
+            .live-space-options label { font-size:11px; }
+            .live-stage-settings input:disabled, .live-pca-controls input:disabled { opacity:.55; }
             .live-status { font-size:11px; color:#adc3d5; margin-top:7px; min-height:28px; overflow-wrap:anywhere; }
             .live-view[data-stale="true"] .live-grid { opacity:.55; }
             .live-view[data-state="error"] .live-status { color:#ffb59e; }
@@ -475,6 +545,18 @@ class LiveView {
         button.textContent = label;
         button.addEventListener('click', action);
         return button;
+    }
+
+    filterCheckbox(text: string, aria: string, checked: boolean, update: (checked: boolean) => void) {
+        const label = document.createElement('label'); label.className = 'live-junction-toggle';
+        const input = document.createElement('input'); input.type = 'checkbox'; input.checked = checked;
+        input.setAttribute('aria-label', aria);
+        input.addEventListener('change', () => {
+            update(input.checked);
+            this.queueComparisonRender();
+        });
+        label.append(input, text);
+        return label;
     }
 
     mount() {
@@ -502,7 +584,8 @@ class LiveView {
         this.binaryInput.type = 'checkbox';
         this.binaryInput.addEventListener('change', () => this.drawMask());
         maskLabel.append(this.binaryInput, 'Binary mask');
-        controls.append(enabledLabel, maskLabel, this.button('Refresh', () => this.refresh()));
+        controls.append(enabledLabel, maskLabel, this.button('Refresh', () => this.refresh()),
+            this.button('Finding landing branches', () => this.comparisonView.landing.scrollIntoView({ block: 'start' })));
         const yellowLabel = document.createElement('label');
         const yellowInput = document.createElement('input');
         yellowInput.type = 'checkbox'; yellowInput.checked = true;
@@ -589,6 +672,7 @@ class LiveView {
         const trunkLabel = document.createElement('label');
         const trunkInput = document.createElement('input');
         trunkInput.type = 'checkbox';
+        trunkInput.checked = this.excludeTrunk;
         trunkInput.setAttribute('aria-label', 'Exclude trunk');
         trunkInput.addEventListener('change', () => {
             this.excludeTrunk = trunkInput.checked;
@@ -599,7 +683,7 @@ class LiveView {
         const reset = this.button('Reset search', () => {
             this.horizontalAngle = 25; this.minBranchLength = 12;
             this.minLengthWidthRatio = 1.5; this.minDirectionConfidence = 0.5;
-            this.excludeTrunk = false; trunkInput.checked = false;
+            this.excludeTrunk = true; trunkInput.checked = true;
             for (const [control, value, suffix] of [[angle, 25, '°'], [length, 12, 'px'],
                 [shape, 1.5, '×'], [confidence, 0.5, '']] as const) {
                 control.slider.value = String(value);
@@ -723,7 +807,7 @@ class LiveView {
         this.pcaMergedCanvas = pcaMerged.canvas; this.pcaMergedLabel = pcaMerged.caption;
         this.pcaSummary = document.createElement('div'); this.pcaSummary.className = 'live-junction-summary';
         this.pcaSummary.textContent = 'PCA will fit each DA2 segment after relative depth arrives.';
-        pcaTile.append(pcaTitle, pcaControls, pcaGrid, this.pcaSummary);
+        pcaTile.append(pcaTitle, pcaGrid, this.pcaSummary);
         grid.append(pcaTile);
         const gravityTile = document.createElement('div');
         gravityTile.className = 'live-tile live-junction-tile live-gravity-tile';
@@ -795,8 +879,19 @@ class LiveView {
         });
         gravityComponentLabel.append(this.gravityComponentCheckbox,
             document.createTextNode('Require each component horizontal'));
-        gravityLengthControls.append(gravityLengthLabel, this.gravityLengthSlider, this.gravityLengthNumber,
-            document.createTextNode('px'), gravityComponentLabel, gravityTrunkLabel);
+        gravityLengthControls.append(gravityLengthLabel, this.gravityLengthSlider, this.gravityLengthNumber, document.createTextNode('px'));
+        const gravityOptions = document.createElement('div'); gravityOptions.className = 'live-pca-controls';
+        const setGravityAngle = (enabled: boolean) => {
+            this.filterGravityAngle = enabled;
+            this.gravityAngleSlider.disabled = this.gravityAngleNumber.disabled = this.gravityComponentCheckbox.disabled = !enabled;
+        };
+        const setGravityLength = (enabled: boolean) => {
+            this.filterGravityLength = enabled;
+            this.gravityLengthSlider.disabled = this.gravityLengthNumber.disabled = this.gsLengthSlider.disabled = this.gsLengthNumber.disabled = !enabled;
+        };
+        gravityControls.prepend(this.filterCheckbox('수평각 검사', 'Enable gravity angle filter', this.filterGravityAngle, setGravityAngle));
+        gravityLengthControls.prepend(this.filterCheckbox('최소 길이 검사', 'Enable minimum length filter', this.filterGravityLength, setGravityLength));
+        gravityOptions.append(gravityComponentLabel, gravityTrunkLabel);
         const gsLengthControls = document.createElement('div');
         gsLengthControls.className = 'live-pca-controls';
         const gsLengthLabel = document.createElement('label'); gsLengthLabel.textContent = '3DGS minimum skeleton length';
@@ -817,6 +912,8 @@ class LiveView {
         this.gsLengthSlider.addEventListener('input', () => updateGsLength(Number(this.gsLengthSlider.value)));
         this.gsLengthNumber.addEventListener('change', () => updateGsLength(Number(this.gsLengthNumber.value)));
         gsLengthControls.append(gsLengthLabel, this.gsLengthSlider, this.gsLengthNumber, document.createTextNode('cm'));
+        setGravityAngle(this.filterGravityAngle);
+        setGravityLength(this.filterGravityLength);
         const gravityGrid = document.createElement('div'); gravityGrid.className = 'live-junction-grid';
         const gravityView = (label: string) => {
             const view = document.createElement('div'); view.className = 'live-junction-view';
@@ -831,30 +928,116 @@ class LiveView {
         this.gravityFilteredCanvas = gravityFiltered.canvas; this.gravityFilteredLabel = gravityFiltered.caption;
         this.gravitySummary = document.createElement('div'); this.gravitySummary.className = 'live-junction-summary';
         this.gravitySummary.textContent = 'Merged PCA axes will be checked against gravity.';
-        gravityTile.append(gravityTitle, gravityControls, gravityLengthControls, gsLengthControls, gravityGrid, this.gravitySummary);
+        gravityTile.append(gravityTitle, gravityGrid, this.gravitySummary);
         grid.append(gravityTile);
         const finalTile = document.createElement('div');
         finalTile.className = 'live-tile live-junction-tile live-final-tile';
         const finalTitle = document.createElement('div'); finalTitle.className = 'live-tile-title';
         finalTitle.textContent = 'Final landing candidate segmentation';
-        const finalControls = document.createElement('div'); finalControls.className = 'live-pca-controls';
-        const cameraControls = document.createElement('div'); cameraControls.className = 'live-pca-controls';
-        const cameraHeading = document.createElement('strong'); cameraHeading.textContent = 'Camera approach';
-        cameraControls.append(cameraHeading);
+        const geometryControls = document.createElement('details'); geometryControls.className = 'live-stage-settings';
+        const geometryTitle = document.createElement('summary'); geometryTitle.textContent = '가지 형상·시점 필터 · 공간 필터 전';
+        const finalControls = document.createElement('div'); finalControls.className = 'live-stage-sliders';
+        const finalDepthControls = document.createElement('div'); finalDepthControls.className = 'live-stage-sliders';
+        const finalHeightControls = document.createElement('div'); finalHeightControls.className = 'live-stage-sliders';
+        const foliageControls = document.createElement('div'); foliageControls.className = 'live-stage-sliders';
+        const cameraControls = document.createElement('div'); cameraControls.className = 'live-stage-sliders';
+        geometryControls.append(geometryTitle, finalControls, finalDepthControls, finalHeightControls, foliageControls, cameraControls);
         const strictCameraLabel = document.createElement('label'); strictCameraLabel.className = 'live-junction-toggle';
         this.finalStrictCameraCheckbox = document.createElement('input'); this.finalStrictCameraCheckbox.type = 'checkbox';
         this.finalStrictCameraCheckbox.checked = this.finalStrictCameraAngles;
         this.finalStrictCameraCheckbox.setAttribute('aria-label', 'Require camera angles');
         this.finalStrictCameraCheckbox.addEventListener('change', () => {
-            this.finalStrictCameraAngles = this.finalStrictCameraCheckbox.checked;
+            setCameraAngles(this.finalStrictCameraCheckbox.checked);
             if (this.last) this.drawFinalPanel(this.last);
         });
-        strictCameraLabel.append(this.finalStrictCameraCheckbox, 'Require angles');
+        strictCameraLabel.append(this.finalStrictCameraCheckbox, '카메라 시점 각도 검사');
         cameraControls.append(strictCameraLabel);
+        const spaceControls = document.createElement('fieldset'); spaceControls.className = 'live-stage-settings';
+        const spaceTitle = document.createElement('legend'); spaceTitle.textContent = '물리적 공간 필터 · 위쪽 꼭짓점';
+        spaceControls.append(spaceTitle);
+        const spaceToggleLabel = document.createElement('label'); spaceToggleLabel.className = 'live-junction-toggle';
+        const spaceToggle = document.createElement('input'); spaceToggle.type = 'checkbox'; spaceToggle.checked = this.birdSpace.enabled;
+        spaceToggle.setAttribute('aria-label', 'Enable bird space filter');
+        spaceToggle.addEventListener('change', () => {
+            this.birdSpace.enabled = spaceToggle.checked;
+            this.queueComparisonRender();
+        });
+        spaceToggleLabel.append(spaceToggle, '공간 검사 적용');
+        const spaceParameters = document.createElement('div'); spaceParameters.className = 'live-space-parameters';
+        const spaceOptions = document.createElement('div'); spaceOptions.className = 'live-space-options';
+        const boxDimensions = document.createElement('div'); boxDimensions.className = 'live-pca-controls';
+        const showDimensions = () => {
+            const { low, high } = birdBoxBounds(this.birdSpace);
+            const dimensions = [1, 0, 2].map(i => Math.round((high[i] - low[i]) * 1000) / 10);
+            boxDimensions.textContent = `실선 검사 박스 ${dimensions.join(' × ')} cm` +
+                (this.birdSpace.checkApproachPath ? ` · 점선 접근 거리 최대 ${this.birdSpace.approachM} m` : '');
+        };
+        showDimensions();
+        spaceControls.append(spaceToggleLabel, spaceParameters, boxDimensions, spaceOptions);
+        for (const [field, label, scale, min, max] of [
+            ['widthM', '날개 전개 폭 (cm)', 100, 1, 500], ['lengthM', '앞뒤 길이 (cm)', 100, 1, 500],
+            ['heightM', '발~최고점 높이 (cm)', 100, 1, 500], ['marginM', '면당 여유 (cm)', 100, 0, 100],
+            ['approachM', '마지막 접근 거리 (m)', 1, 0, 10], ['minApproachAngleDeg', '최소 접근각 (°)', 1, 0, 90]
+        ] as const) {
+            const holder = document.createElement('label');
+            const caption = document.createElement('span'); caption.textContent = label;
+            const input = document.createElement('input'); input.type = 'number'; input.min = `${min}`; input.max = `${max}`;
+            input.name = field;
+            input.step = field === 'approachM' ? '0.1' : '1'; input.value = String(this.birdSpace[field] * scale);
+            input.addEventListener('change', () => {
+                const value = input.valueAsNumber;
+                if (!Number.isFinite(value) || value < min || value > max) {
+                    input.value = String(this.birdSpace[field] * scale);
+                    return;
+                }
+                this.birdSpace[field] = value / scale;
+                showDimensions();
+                this.queueComparisonRender();
+            });
+            holder.append(caption, input);
+            if (field === 'approachM' || field === 'minApproachAngleDeg') {
+                const isPath = field === 'approachM';
+                const option = isPath ? 'checkApproachPath' : 'checkApproachAngle';
+                input.disabled = !this.birdSpace[option];
+                const row = document.createElement('div'); row.className = 'live-pca-controls';
+                row.append(this.filterCheckbox(isPath ? '접근 통로 검사' : '최소 접근각 검사',
+                    isPath ? 'Check approach path' : 'Check minimum approach angle', this.birdSpace[option], enabled => {
+                        this.birdSpace[option] = enabled;
+                        input.disabled = !enabled;
+                        showDimensions();
+                    }), holder);
+                spaceOptions.append(row);
+            } else {
+                spaceParameters.append(holder);
+            }
+        }
+        const da2Reference = document.createElement('input');
+        da2Reference.type = 'number'; da2Reference.name = 'da2ReferenceM';
+        da2Reference.min = '0.1'; da2Reference.max = '100'; da2Reference.step = '0.1';
+        da2Reference.placeholder = '자동';
+        da2Reference.title = '비워두면 현재 3DGS의 미터 스케일로 DA2 거리를 자동 보정합니다.';
+        da2Reference.addEventListener('change', () => {
+            if (da2Reference.value === '') {
+                this.da2SpaceReferenceM = null;
+                this.queueComparisonRender();
+                return;
+            }
+            const value = da2Reference.valueAsNumber;
+            if (!Number.isFinite(value) || value < 0.1 || value > 100) {
+                da2Reference.value = this.da2SpaceReferenceM?.toString() ?? '';
+                return;
+            }
+            this.da2SpaceReferenceM = value;
+            this.queueComparisonRender();
+        });
+        const da2Scale = document.createElement('label'); da2Scale.className = 'live-pca-controls';
+        da2Scale.append('DA2 거리 보정 · 수동 중앙값 (m)', da2Reference);
+        spaceOptions.append(da2Scale);
         const finalSetting = (name: string, aria: string, min: number, max: number, step: number,
             initial: number, suffix: string, update: (value: number) => void,
             container = finalControls) => {
-            const label = document.createElement('label'); label.textContent = name;
+            const label = document.createElement('label'); label.className = 'live-stage-slider';
+            const caption = document.createElement('span'); caption.textContent = name;
             const slider = document.createElement('input'); slider.type = 'range';
             slider.min = String(min); slider.max = String(max); slider.step = String(step); slider.value = String(initial);
             slider.setAttribute('aria-label', aria);
@@ -863,7 +1046,8 @@ class LiveView {
                 update(Number(slider.value)); value.textContent = `${slider.value}${suffix}`;
                 if (this.last) this.drawFinalPanel(this.last);
             });
-            container.append(label, slider, value);
+            label.append(caption, slider, value);
+            container.append(label);
             return slider;
         };
         this.finalWidthSlider = finalSetting('Max apparent width', 'Maximum landing branch width', 4, 80, 2,
@@ -875,27 +1059,53 @@ class LiveView {
         this.finalCylinderInlierSlider = finalSetting('Min cylinder inliers', 'Minimum projected cylinder inlier fraction', 0, 1, 0.05,
             this.finalMinCylinderInlier, '', value => { this.finalMinCylinderInlier = value; });
         this.finalDepthSlider = finalSetting('Max relative depth spread', 'Maximum landing relative depth spread', 0.05, 1, 0.05,
-            this.finalMaxDepthStdRelative, '', value => { this.finalMaxDepthStdRelative = value; });
+            this.finalMaxDepthStdRelative, '', value => { this.finalMaxDepthStdRelative = value; }, finalDepthControls);
         this.finalHeightSlider = finalSetting('Min relative height', 'Minimum landing relative height', 0, 0.5, 0.05,
-            this.finalMinRelativeHeight, '', value => { this.finalMinRelativeHeight = value; });
+            this.finalMinRelativeHeight, '', value => { this.finalMinRelativeHeight = value; }, finalHeightControls);
         this.finalWoodSlider = finalSetting('Min non-green fraction', 'Minimum non-green branch fraction', 0, 1, 0.05,
-            this.finalMinWoodyFraction, '', value => { this.finalMinWoodyFraction = value; });
+            this.finalMinWoodyFraction, '', value => { this.finalMinWoodyFraction = value; }, foliageControls);
         const foliageLabel = document.createElement('label'); foliageLabel.className = 'live-junction-toggle';
         this.finalFoliageCheckbox = document.createElement('input'); this.finalFoliageCheckbox.type = 'checkbox';
         this.finalFoliageCheckbox.checked = this.finalRejectFoliage;
         this.finalFoliageCheckbox.setAttribute('aria-label', 'Reject green foliage');
         this.finalFoliageCheckbox.addEventListener('change', () => {
             this.finalRejectFoliage = this.finalFoliageCheckbox.checked;
+            this.finalWoodSlider.disabled = !this.finalRejectFoliage;
             if (this.last) this.drawFinalPanel(this.last);
         });
-        foliageLabel.append(this.finalFoliageCheckbox, 'Reject green foliage'); finalControls.append(foliageLabel);
+        foliageLabel.append(this.finalFoliageCheckbox, '초록 잎 제외'); foliageControls.prepend(foliageLabel);
+        this.finalWoodSlider.disabled = !this.finalRejectFoliage;
         this.finalBearingSlider = finalSetting('Max center angle', 'Maximum camera center bearing angle', 0, 90, 5,
             this.finalMaxCenterBearing, '°', value => { this.finalMaxCenterBearing = value; }, cameraControls);
         this.finalEndOnSlider = finalSetting('Max axis toward camera', 'Maximum branch axis angle toward camera; 90 degrees allows any direction', 0, 90, 5,
             this.finalMaxEndOn, '°', value => { this.finalMaxEndOn = value; }, cameraControls);
         this.finalImageTiltSlider = finalSetting('Max screen tilt', 'Maximum branch tilt in camera image', 0, 90, 5,
             this.finalMaxImageTilt, '°', value => { this.finalMaxImageTilt = value; }, cameraControls);
-        const finalTopKLabel = document.createElement('label'); finalTopKLabel.textContent = 'Top K';
+        const setShape = (enabled: boolean) => {
+            this.filterLandingShape = enabled;
+            for (const input of [this.finalWidthSlider, this.finalLinearitySlider, this.finalProjectedLinearitySlider, this.finalCylinderInlierSlider]) {
+                input.disabled = !enabled;
+            }
+        };
+        finalControls.prepend(this.filterCheckbox('가지 폭·직선성·원통형 검사', 'Enable branch shape filter', this.filterLandingShape, setShape));
+        setShape(this.filterLandingShape);
+        finalDepthControls.prepend(this.filterCheckbox('깊이 분산 검사', 'Enable depth spread filter', this.filterLandingDepthSpread, enabled => {
+            this.filterLandingDepthSpread = enabled;
+            this.finalDepthSlider.disabled = !enabled;
+        }));
+        this.finalDepthSlider.disabled = !this.filterLandingDepthSpread;
+        finalHeightControls.prepend(this.filterCheckbox('상대 높이 검사', 'Enable relative height filter', this.filterLandingRelativeHeight, enabled => {
+            this.filterLandingRelativeHeight = enabled;
+            this.finalHeightSlider.disabled = !enabled;
+        }));
+        this.finalHeightSlider.disabled = !this.filterLandingRelativeHeight;
+        const setCameraAngles = (enabled: boolean) => {
+            this.finalStrictCameraAngles = enabled;
+            this.finalBearingSlider.disabled = this.finalEndOnSlider.disabled = this.finalImageTiltSlider.disabled = !enabled;
+        };
+        setCameraAngles(this.finalStrictCameraAngles);
+        const finalTopKLabel = document.createElement('label'); finalTopKLabel.className = 'live-pca-controls';
+        finalTopKLabel.textContent = 'Top K';
         this.finalTopKInput = document.createElement('input'); this.finalTopKInput.type = 'number';
         this.finalTopKInput.min = '1'; this.finalTopKInput.max = '253'; this.finalTopKInput.step = '1';
         this.finalTopKInput.value = String(this.finalTopK);
@@ -906,7 +1116,13 @@ class LiveView {
             this.finalTopK = Math.min(253, value);
             if (this.last) this.drawFinalPanel(this.last);
         });
-        finalTopKLabel.append(this.finalTopKInput); finalControls.append(finalTopKLabel);
+        this.finalTopKInput.addEventListener('change', () => { this.finalTopKInput.value = String(this.finalTopK); });
+        finalTopKLabel.append(this.finalTopKInput);
+        const finalLimit = this.filterCheckbox('Top K로 표시 제한', 'Limit final landing results to Top K', this.limitFinalTopK, enabled => {
+            this.limitFinalTopK = enabled;
+            this.finalTopKInput.disabled = !enabled;
+        });
+        this.finalTopKInput.disabled = !this.limitFinalTopK;
         const finalGrid = document.createElement('div'); finalGrid.className = 'live-junction-grid';
         const finalView = (caption: string) => {
             const view = document.createElement('div'); view.className = 'live-junction-view';
@@ -941,7 +1157,9 @@ class LiveView {
                     `Wood ${(candidate.wood_fraction * 100).toFixed(0)}%, 3D line ${candidate.linearity.toFixed(2)}, ` +
                     `image line ${candidate.projected_linearity.toFixed(2)}, cylinder inliers ` +
                     `${(candidate.cylinder_inlier_fraction * 100).toFixed(0)}%, relative height ` +
-                    `${candidate.relative_height.toFixed(2)}, length ${candidate.centerline_length_px}px.`;
+                    `${candidate.relative_height.toFixed(2)}, length ${candidate.centerline_length_px}px. ${describeSpace(candidate.space)}`;
+                this.spaceInspectIds.da2 = id;
+                this.queueComparisonRender();
                 return;
             }
             const mergedId = snapshot.gravityMergedLabels?.[small] ?? 0;
@@ -972,7 +1190,7 @@ class LiveView {
         this.finalDiagnostics.className = 'live-junction-summary';
         this.finalDiagnostics.textContent = 'Candidate rejection reasons will appear here.';
         this.finalDiagnostics.dataset.default = this.finalDiagnostics.textContent;
-        finalTile.append(finalTitle, finalControls, cameraControls, finalGrid, this.finalSummary, this.finalDiagnostics);
+        finalTile.append(finalTitle, finalGrid, this.finalSummary, this.finalDiagnostics);
         grid.append(finalTile);
         this.status = document.createElement('div');
         this.status.className = 'live-status';
@@ -986,11 +1204,16 @@ class LiveView {
             if (this.last) navigator.clipboard.writeText(JSON.stringify(this.last.pose, null, 2)).catch(error => this.message('error', error.message));
         }));
         root.append(profile, controls, search, grid, this.status, save);
-        const sharedControls = [...grid.querySelectorAll<HTMLElement>('.live-pca-controls')];
         for (const panel of [junctionTile, pcaTile, gravityTile, finalTile, this.branchCanvas.parentElement]) {
             panel.style.display = 'none';
         }
-        this.comparisonView = new DepthComparisonView(grid, sharedControls, value => {
+        this.comparisonView = new DepthComparisonView(grid, {
+            merged: [pcaControls],
+            gravity: [gravityControls, gravityLengthControls, gsLengthControls, gravityOptions],
+            geometry: geometryControls,
+            space: spaceControls,
+            final: [finalLimit, finalTopKLabel]
+        }, value => {
             this.depthGapThreshold = value;
             this.analysisRevision++;
             if (this.last) this.reanalyzeDepths(this.last);
@@ -1051,7 +1274,7 @@ class LiveView {
 
     sourceKey(source: AnnotationSource) {
         const splat = source.splat;
-        return JSON.stringify([source.boxes, source.metersPerSceneUnit, source.scaleReference,
+        return JSON.stringify([source.boxes, source.metersPerSceneUnit, source.scaleReference, source.heightReference,
             splat?.changedCounter, splat?.splatData.numSplats,
             splat ? Array.from(splat.worldTransform.data) : null]);
     }
@@ -1138,6 +1361,65 @@ class LiveView {
         this.memberSplat = splat;
     }
 
+    annotationFrame(source: AnnotationSource, result: any, frameId: string, fingerprint: string, gravity: GravitySample | null) {
+        // RGB is already composited against black in the offscreen target.
+        // Make it opaque to avoid applying Gaussian alpha a second time.
+        for (let i = 3; i < result.rgb.length; i += 4) result.rgb[i] = 255;
+        const originalRgb = pixelCanvas(result.rgb, 963, 544);
+        const mask = squareCanvas(pixelCanvas(visibleMask(result.membership), 963, 544), false);
+        const pose: any = {
+            frame_id: frameId,
+            captured_at_utc: new Date().toISOString(),
+            width: 640,
+            height: 640,
+            camera_profile: SENSOR_PROFILE,
+            intrinsics: sensorIntrinsics(),
+            coordinate_system: 'PlayCanvas scene world; camera +X right, +Y up, -Z forward',
+            world_up_axis: this.scene.camera.upAxis,
+            matrix_layout: 'row-major',
+            units: 'scene',
+            position: result.position,
+            quaternion_xyzw: result.quaternion,
+            position_meters: result.position.map((v: number) => v * source.metersPerSceneUnit),
+            meters_per_scene_unit: source.metersPerSceneUnit,
+            height_reference: source.heightReference ?? null,
+            camera_to_world: rowMajorMatrix(result.world),
+            world_to_camera: rowMajorMatrix(result.view),
+            projection_matrix: rowMajorMatrix(result.projection),
+            near: result.near,
+            far: result.far,
+            segmentation: { type: 'visible_gaussian_contribution',
+                opacity_threshold: 0.05,
+                contribution_ratio_threshold: 0.5,
+                annotations: source.boxes }
+        };
+        pose.gravity = resolveGravityWorld(gravity, pose);
+        const gsDepth = squareDepth(result.depthScene, 963, 544, source.metersPerSceneUnit);
+        pose.gs_depth = { model: '3DGS opacity-weighted Gaussian-center depth',
+            units: 'approximate meters', meters_per_scene_unit: source.metersPerSceneUnit,
+            scale_reference: source.scaleReference ?? null,
+            calibration_source: source.heightReference ? 'tree_height' : source.scaleReference ? 'measured_bbox' : 'scene_scale',
+            skeleton_length_method: 'sum_of_visible_3d_skeleton_edges_cm',
+            background: 'NaN', width: 640, height: 640 };
+        const snapshot: LiveSnapshot = { frameId, fingerprint, rgb: squareCanvas(originalRgb, true), mask,
+            pose, depth: null, gsDepth };
+        return { snapshot, originalRgb };
+    }
+
+    async captureTreeFrame(source: AnnotationSource, frameId: string) {
+        this.updateMembership(source);
+        const result = await this.events.invoke('render.annotationSnapshot', 963, 544, true);
+        const { gravity_world } = source.heightReference;
+        const gravity = { frame: 'world', vector: gravity_world } as GravitySample;
+        const { snapshot, originalRgb } = this.annotationFrame(source, result, frameId, '', gravity);
+        snapshot.pose.gravity.source = '3dgs_pose';
+        snapshot.pose.gravity.vector_camera = [0, 1, 2].map(column =>
+            snapshot.pose.gravity.vector.reduce((sum: number, value: number, row: number) =>
+                sum + value * snapshot.pose.camera_to_world[row][column], 0));
+        const [rgb, mask, sensorRgb] = await Promise.all([pngBlob(snapshot.rgb), pngBlob(snapshot.mask), pngBlob(originalRgb)]);
+        return { rgb, mask, sensorRgb, pose: snapshot.pose, depth: new Blob([numpyFloat32(snapshot.gsDepth, 640, 640).buffer as ArrayBuffer]) };
+    }
+
     async capture(source: AnnotationSource, key: string) {
         this.busy = true;
         this.capturing = true;
@@ -1154,53 +1436,14 @@ class LiveView {
         }
         try {
             if (!this.enabled || key !== this.viewFingerprint(this.getSource())) return;
-            // RGB is already composited against black in the offscreen target.
-            // Make it opaque to avoid applying Gaussian alpha a second time.
-            for (let i = 3; i < result.rgb.length; i += 4) result.rgb[i] = 255;
-            const originalRgb = pixelCanvas(result.rgb, 963, 544);
-            const mask = squareCanvas(pixelCanvas(visibleMask(result.membership), 963, 544), false);
-            const pose: any = {
-                frame_id: frameId,
-                captured_at_utc: new Date().toISOString(),
-                width: 640,
-                height: 640,
-                camera_profile: SENSOR_PROFILE,
-                intrinsics: sensorIntrinsics(),
-                coordinate_system: 'PlayCanvas scene world; camera +X right, +Y up, -Z forward',
-                world_up_axis: this.scene.camera.upAxis,
-                matrix_layout: 'row-major',
-                units: 'scene',
-                position: result.position,
-                quaternion_xyzw: result.quaternion,
-                position_meters: result.position.map((v: number) => v * source.metersPerSceneUnit),
-                meters_per_scene_unit: source.metersPerSceneUnit,
-                camera_to_world: rowMajorMatrix(result.world),
-                world_to_camera: rowMajorMatrix(result.view),
-                projection_matrix: rowMajorMatrix(result.projection),
-                near: result.near,
-                far: result.far,
-                segmentation: { type: 'visible_gaussian_contribution',
-                    opacity_threshold: 0.05,
-                    contribution_ratio_threshold: 0.5,
-                    annotations: source.boxes }
-            };
-            pose.gravity = resolveGravityWorld(this.imuGravity, pose);
-            const gsDepth = squareDepth(result.depthScene, 963, 544, source.metersPerSceneUnit);
-            pose.gs_depth = { model: '3DGS opacity-weighted Gaussian-center depth',
-                units: 'approximate meters', meters_per_scene_unit: source.metersPerSceneUnit,
-                scale_reference: source.scaleReference ?? null,
-                calibration_source: source.scaleReference ? 'measured_bbox' : 'scene_scale',
-                skeleton_length_method: 'sum_of_visible_3d_skeleton_edges_cm',
-                background: 'NaN', width: 640, height: 640 };
-            const snapshot: LiveSnapshot = { frameId, fingerprint: key, rgb: squareCanvas(originalRgb, true), mask,
-                pose, depth: null, gsDepth };
+            const { snapshot, originalRgb } = this.annotationFrame(source, result, frameId, key, this.imuGravity);
             this.last = snapshot;
             this.figuresButton.disabled = true;
             this.hideMainLanding();
             this.rgbCanvas.getContext('2d').drawImage(snapshot.rgb, 0, 0);
             this.drawMask();
             this.depthPreview.getContext('2d').clearRect(0, 0, 640, 640);
-            this.gsDepthPreview.getContext('2d').drawImage(depthCanvas(gsDepth, true), 0, 0);
+            this.gsDepthPreview.getContext('2d').drawImage(depthCanvas(snapshot.gsDepth, true), 0, 0);
             this.gsDepthTitle.textContent = source.scaleReference ?
                 `3DGS depth · BBox ${source.scaleReference.box_id} ${source.scaleReference.axis} = ${(source.scaleReference.actual_length_m * 100).toFixed(1)} cm` :
                 `3DGS depth · approximate scale (1 unit = ${source.metersPerSceneUnit.toFixed(4)} m)`;
@@ -1338,14 +1581,14 @@ class LiveView {
         });
     }
 
-    detectBranches(snapshot: LiveSnapshot, source?: DepthSource): Promise<BranchDetection> {
-        if (!this.detectorWorker) {
+    detectBranches(snapshot: LiveSnapshot, source?: DepthSource, replay = false): Promise<BranchDetection> {
+        if (!source && !this.detectorWorker) {
             this.detectorWorker = new Worker(new URL('static/lib/branch-detector/worker.mjs', document.baseURI), { type: 'module' });
         }
-        if (source) this.analysisCancel[source]?.();
+        if (source && !replay) this.analysisCancel[source]?.();
         const worker = source ? new Worker(new URL('static/lib/branch-detector/worker.mjs', document.baseURI), { type: 'module' }) : this.detectorWorker;
         const requestId = ++this.analysisRequestId;
-        if (source) this.analysisWorkers[source] = worker;
+        if (source && !replay) this.analysisWorkers[source] = worker;
         const rgba = new Uint8Array(snapshot.rgb.getContext('2d').getImageData(0, 0, 640, 640).data);
         const maskRgba = snapshot.mask.getContext('2d').getImageData(0, 0, 640, 640).data;
         const mask = new Uint8Array(640 * 640);
@@ -1372,7 +1615,7 @@ class LiveView {
                 if (!source) { worker.terminate(); this.detectorWorker = null; }
                 reject(new Error('Branch worker timed out'));
             }, 30000);
-            if (source) this.analysisCancel[source] = () => { cleanup(); reject(new Error('Analysis superseded')); };
+            if (source && !replay) this.analysisCancel[source] = () => { cleanup(); reject(new Error('Analysis superseded')); };
             worker.onmessage = ({ data }) => {
                 if (data.frameId !== snapshot.frameId || (source && (data.requestId !== requestId ||
                     data.depthSource !== source || data.analysisRevision !== snapshot.analysisRevision))) return;
@@ -1398,6 +1641,81 @@ class LiveView {
             comparisonCrop: this.comparisonCrop(root), analysisStatus: 'pending', analysisRevision: this.analysisRevision };
     }
 
+    setBranchDetection(analysis: LiveSnapshot, result: BranchDetection) {
+        const rgba = new Uint8Array(640 * 640 * 4);
+        for (let i = 0; i < result.processedMask.length; i++) {
+            rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = result.processedMask[i];
+            rgba[i * 4 + 3] = 255;
+        }
+        analysis.mask = pixelCanvas(rgba, 640, 640);
+        analysis.detection = result;
+        analysis.rawSkeleton = result.rawSkeleton;
+        analysis.rawSkeletonCount = result.rawSkeletonCount;
+        analysis.rawJunctions = result.rawJunctions;
+        analysis.linkLabels = result.linkLabels;
+        analysis.linkCount = result.linkCount;
+        analysis.boundary = result.boundary;
+        analysis.missing = result.missing;
+        analysis.validFraction = result.validFraction;
+        analysis.boundaryCells = result.boundaryCells;
+        analysis.missingCells = result.missingCells;
+        analysis.skeletonLengthCm = result.skeletonLengthCm;
+        analysis.metricLengthCoverage = result.metricLengthCoverage;
+        analysis.analysisStatus = 'ready';
+    }
+
+    async evaluateTreeFrame(frame: TreeEvaluationFrame) {
+        const { frameId, rgb, gtMask, predictionMask, pose, da2Depth, calibrationDepth } = frame;
+        const k = pose.intrinsics;
+        const intrinsics = [k[0][0], k[1][1], k[0][2], k[1][2]];
+        const up = [0, 1, 2].map(column => -pose.gravity.vector.reduce((sum: number, value: number, row: number) =>
+            sum + value * pose.camera_to_world[row][column], 0));
+        const box = { ...this.birdSpace, enabled: !frame.skipSpace };
+        const da2Scene = box.enabled ? buildSpaceScene(da2Depth, intrinsics, 640, 640, 1, null, calibrationDepth) : null;
+        if (box.enabled && da2Scene?.geometryUnits !== 'da2_calibrated_meters') {
+            throw new Error(`${frameId}: DA2 metric calibration unavailable`);
+        }
+
+        const process = async (mask: HTMLCanvasElement) => {
+            const analysis: LiveSnapshot = { frameId, fingerprint: '', pose, rgb, mask, depth: da2Depth, gsDepth: null,
+                depthSource: 'da2', depthKind: 'relative_inverse' };
+            this.setBranchDetection(analysis, await this.detectBranches(analysis, 'da2', true));
+            this.mergePcaLabels(analysis);
+            this.computeGravity(analysis);
+            this.computeFinalBase(analysis, null);
+            const base = analysis.finalBase;
+            const stages = frame.includeStages ? {
+                depthMask: analysis.detection.processedMask,
+                skeleton: analysis.rawSkeleton,
+                labels: {
+                    skeleton_links: analysis.linkLabels,
+                    da2_links: analysis.detection.depthLinkLabels,
+                    pca_merge: analysis.pcaMergedLabels,
+                    gravity_merge: analysis.gravityMergedLabels,
+                    gravity_filter: analysis.gravityFilteredLabels,
+                    shape_input: analysis.detection.depthLinkLabels.map((id, pixel) =>
+                        analysis.gravityFilteredLabels[pixel] ? id : 0)
+                }
+            } : undefined;
+            if (!da2Scene) {
+                return { stages, ids: landingCandidateIds(base, base.eligible),
+                    counts: { before: base.eligible.length, clear: null, blocked: 0, unknown: 0 } };
+            }
+            const assessments = evaluateLandingSpace({ scene: da2Scene, candidates: base.eligible, supportPixels: base.supportPixels, up, settings: box });
+            const result = selectSpaceCandidates(base, assessments, null);
+            const clear = result.eligible.filter(candidate => candidate.space?.status === 'clear');
+            const ids = landingCandidateIds(result, clear);
+            return { stages, ids, counts: { before: base.eligible.length, clear: clear.length,
+                blocked: assessments.filter(item => item.status === 'blocked').length,
+                unknown: assessments.filter(item => item.status === 'unknown').length } };
+        };
+        const [da2, reference] = await Promise.all([process(predictionMask), process(gtMask)]);
+        return { da2, reference, calibration: da2Scene?.calibration ?? null,
+            filters: { depthGapThreshold: this.depthGapThreshold, mergeMaxAngle: this.pcaMaxAngle,
+                requireGravityComponents: this.requireGravityComponents, birdSpace: box,
+                da2: this.finalSettings('relative_inverse', null) } };
+    }
+
     async analyzeDepthSource(root: LiveSnapshot, source: DepthSource) {
         const analysis = this.sourceSnapshot(root, source);
         root.analyses ??= {};
@@ -1408,26 +1726,7 @@ class LiveView {
             const result = await this.detectBranches(analysis, source);
             if (root !== this.last || root.analyses[source] !== analysis ||
                 root.fingerprint !== this.viewFingerprint(this.getSource())) return;
-            const rgba = new Uint8Array(640 * 640 * 4);
-            for (let i = 0; i < result.processedMask.length; i++) {
-                rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = result.processedMask[i];
-                rgba[i * 4 + 3] = 255;
-            }
-            analysis.mask = pixelCanvas(rgba, 640, 640);
-            analysis.detection = result;
-            analysis.rawSkeleton = result.rawSkeleton;
-            analysis.rawSkeletonCount = result.rawSkeletonCount;
-            analysis.rawJunctions = result.rawJunctions;
-            analysis.linkLabels = result.linkLabels;
-            analysis.linkCount = result.linkCount;
-            analysis.boundary = result.boundary;
-            analysis.missing = result.missing;
-            analysis.validFraction = result.validFraction;
-            analysis.boundaryCells = result.boundaryCells;
-            analysis.missingCells = result.missingCells;
-            analysis.skeletonLengthCm = result.skeletonLengthCm;
-            analysis.metricLengthCoverage = result.metricLengthCoverage;
-            analysis.analysisStatus = 'ready';
+            this.setBranchDetection(analysis, result);
         } catch (error) {
             if (root !== this.last || root.analyses[source] !== analysis) return;
             analysis.analysisStatus = 'error'; analysis.analysisError = error.message;
@@ -1471,10 +1770,15 @@ class LiveView {
 
     renderDepthComparison(root: LiveSnapshot) {
         const views: Partial<Record<DepthSource, ComparisonSourceView>> = {};
-        const composite = (overlay: HTMLCanvasElement, alpha = 0.65) => {
+        const displayedIds: Partial<Record<DepthSource, Uint32Array>> = {};
+        const composite = (overlay?: HTMLCanvasElement, alpha = 0.65) => {
             const canvas = document.createElement('canvas'); canvas.width = canvas.height = 640;
             const ctx = canvas.getContext('2d'); ctx.globalAlpha = alpha; ctx.drawImage(root.rgb, 0, 0);
-            ctx.globalAlpha = 1; ctx.drawImage(overlay, 0, 0); return canvas;
+            ctx.globalAlpha = 1;
+            if (overlay) {
+                ctx.drawImage(overlay, 0, 0);
+            }
+            return canvas;
         };
         for (const source of ['da2', '3dgs'] as const) {
             const analysis = root.analyses[source];
@@ -1483,7 +1787,9 @@ class LiveView {
                 continue;
             }
             this.computeSourceFilters(analysis);
-            const detection = analysis.detection, final = analysis.finalLanding;
+            const detection = analysis.detection, final = analysis.finalLanding, beforeSpace = analysis.finalBase;
+            const display = this.visibleLanding(analysis);
+            displayedIds[source] = display.result.ids;
             analysis.linkOverlay ??= this.linkOverlay(analysis, analysis.linkLabels);
             analysis.depthLinkOverlay ??= this.linkOverlay(analysis, detection.depthLinkLabels);
             const boundaryPixels = new Uint8ClampedArray(640 * 640 * 4);
@@ -1507,8 +1813,27 @@ class LiveView {
                 boundary: composite(pixelCanvas(boundaryPixels, 640, 640)), skeleton,
                 links: composite(this.linkOverlay(analysis, detection.depthLinkLabels)), pca,
                 merged: composite(analysis.pcaMergedOverlay), gravity: composite(analysis.gravityFilteredOverlay),
-                final: composite(analysis.finalLandingOverlay, 0.45)
+                before_space: composite(eligibleLandingCanvas(beforeSpace), 0.45),
+                after_space: composite(analysis.spacePending ? undefined : eligibleLandingCanvas(display.result, display.overlay), 0.45),
+                final: composite(display.overlay, 0.45)
             };
+            const inspected = this.spaceCandidate(analysis);
+            drawSpaceBox(images.final.getContext('2d'), inspected?.space, analysis.pose.intrinsics);
+            drawSpaceBox(images.after_space.getContext('2d'), inspected?.space, analysis.pose.intrinsics);
+            const clear = final.eligible.filter(candidate => candidate.space?.status === 'clear').length;
+            const unknown = final.eligible.length - clear;
+            const blocked = beforeSpace.eligible.length - final.eligible.length;
+            const spaceRejections = blocked ? summarizeSpaceRejections(final.results.map(candidate => candidate.space)) : '';
+            let afterSpaceCaption = `통과 ${clear} · 미확인 ${unknown} · 탈락 ${blocked}`;
+            if (analysis.spacePending) {
+                afterSpaceCaption = '공간 검사 중…';
+            } else if (!this.birdSpace.enabled) {
+                afterSpaceCaption = `필터 꺼짐 · 후보 ${final.eligible.length}개`;
+            } else if (!beforeSpace.eligible.length) {
+                afterSpaceCaption = '공간 검사에 들어온 후보 0개';
+            } else if (spaceRejections) {
+                afterSpaceCaption += ` · ${spaceRejections}`;
+            }
             const reasons = new Map<string, number>();
             for (const candidate of final.results) for (const reason of candidate.reasons) reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
             const reference = root.pose.gs_depth.scale_reference as BoxScaleReference | null;
@@ -1516,9 +1841,15 @@ class LiveView {
             const lengthLabel = metric ?
                 (analysis.skeletonLengthCm == null ? '3D length unavailable' : `~${analysis.skeletonLengthCm.toFixed(1)} cm visible skeleton`) :
                 `${analysis.rawSkeletonCount} skeleton pixels`;
-            const calibrationLabel = !metric ? '' : reference ?
-                ` · BBox ${reference.box_id} ${reference.axis} ${(reference.actual_length_m * 100).toFixed(1)} cm` : ' · estimated scale';
-            const selectedLengths = final.selected.map(candidate => metric ?
+            const heightReference = root.pose.height_reference;
+            const sceneCalibration = heightReference ? `나무 높이 ${heightReference.actual_height_m} m 기준` : '3DGS 장면 스케일 기준';
+            const da2Calibration = analysis.spaceCalibration;
+            const calibrationLabel = metric ? reference ?
+                ` · BBox ${reference.box_id} ${reference.axis} ${(reference.actual_length_m * 100).toFixed(1)} cm` : ` · ${sceneCalibration}` :
+                da2Calibration?.method === 'assumed_median' ? ` · 깊이 중앙값 ${da2Calibration.median_reference_m} m 가정` :
+                    da2Calibration ? ` · ${sceneCalibration}으로 거리 보정` :
+                        this.birdSpace.enabled && !analysis.spacePending ? ' · 거리 보정 데이터 부족' : '';
+            const selectedLengths = display.result.selected.map(candidate => metric ?
                 `ID ${candidate.id}: ~${candidate.centerline_length_cm?.toFixed(1) ?? '?'} cm` :
                 `ID ${candidate.id}: ${candidate.centerline_length_px.toFixed(0)} px`).join(' · ');
             views[source] = { status: `ready · ${(analysis.validFraction * 100).toFixed(1)}% valid depth${calibrationLabel} · CPU ${detection.cpu_ms.toFixed(1)}ms`, images,
@@ -1528,8 +1859,10 @@ class LiveView {
                     links: `${detection.depthLinkCount} regions`,
                     pca: `${detection.pcaObjects.filter(object => object.reliable).length} reliable 3D axes`,
                     merged: `${analysis.pcaMergedCount} merged regions`,
-                    gravity: `${new Set(analysis.gravityFilteredLabels).size - (analysis.gravityFilteredLabels.includes(0) ? 1 : 0)} retained regions · min length ${metric ? `${this.minSkeletonLengthCm} cm` : `${this.minGravityLength} px`}`,
-                    final: `${final.selected.length} shown / ${final.eligible.length} eligible · ${selectedLengths} · rejected: ${[...reasons].map(([key, count]) => `${key} ${count}`).join(', ') || 'none'}`
+                    gravity: `${new Set(analysis.gravityFilteredLabels).size - (analysis.gravityFilteredLabels.includes(0) ? 1 : 0)} retained regions${this.filterGravityLength ? ` · min length ${metric ? `${this.minSkeletonLengthCm} cm` : `${this.minGravityLength} px`}` : ''}`,
+                    before_space: `후보 ${beforeSpace.eligible.length}개`,
+                    after_space: afterSpaceCaption,
+                    final: `${display.result.selected.length} shown / ${display.result.eligible.length} eligible · ${selectedLengths} · ${analysis.spacePending ? '공간 검사 중…' : describeSpace(inspected?.space)} · rejected: ${[...reasons].map(([key, count]) => `${key} ${count}`).join(', ') || 'none'}`
                 },
                 inspect: (x, y) => {
                     if (x < 0 || x >= 640 || y < 0 || y >= 640) return '';
@@ -1537,16 +1870,17 @@ class LiveView {
                     const candidate = final.results.find(item => item.id === id);
                     const object = detection.pcaObjects.find(item => item.id === id);
                     const length = metric ? `~${object?.centerlineLengthCm?.toFixed(1) ?? '?'} cm` : `${object?.centerlineLengthPx ?? 0} px`;
-                    return candidate ? `ID ${id} · skeleton ${length} · ${candidate.reasons.length ? candidate.reasons.join(', ') : 'eligible'} · angle ${candidate.angle_from_horizontal_deg.toFixed(1)}° · line ${candidate.linearity.toFixed(2)} · width ${candidate.apparent_width_px.toFixed(1)}px` :
+                    if (candidate && this.spaceInspectIds[source] !== id) { this.spaceInspectIds[source] = id; this.queueComparisonRender(); }
+                    return candidate ? `ID ${id} · skeleton ${length} · ${candidate.reasons.length ? candidate.reasons.join(', ') : 'eligible'} · angle ${candidate.angle_from_horizontal_deg.toFixed(1)}° · line ${candidate.linearity.toFixed(2)} · width ${candidate.apparent_width_px.toFixed(1)}px · ${describeSpace(candidate.space)}` :
                         object ? `ID ${id} · skeleton ${length} · filtered before final stage` : 'No valid branch at this pixel';
                 } };
         }
         const da = root.analyses.da2, gs = root.analyses['3dgs'];
         const diffPixels = new Uint8ClampedArray(640 * 640 * 4);
         let overlap = 0, daOnly = 0, gsOnly = 0;
-        if (da?.analysisStatus === 'ready' && gs?.analysisStatus === 'ready') {
+        if (displayedIds.da2 && displayedIds['3dgs']) {
             for (let p = 0; p < 640 * 640; p++) {
-                const a = !!da.finalLanding.ids[p], b = !!gs.finalLanding.ids[p];
+                const a = !!displayedIds.da2[p], b = !!displayedIds['3dgs'][p];
                 if (a && b) { overlap++; diffPixels.set([255, 255, 255, 225], p * 4); }
                 else if (a) { daOnly++; diffPixels.set([0, 235, 245, 230], p * 4); }
                 else if (b) { gsOnly++; diffPixels.set([255, 40, 205, 230], p * 4); }
@@ -1557,13 +1891,13 @@ class LiveView {
         const summary = da?.analysisStatus === 'ready' && gs?.analysisStatus === 'ready' ?
             `Final mask comparison · white overlap ${overlap}px · cyan DA2 only ${daOnly}px · magenta 3DGS only ${gsOnly}px · ${union ? `IoU ${(100 * overlap / union).toFixed(1)}%` : 'both masks empty'} · IDs are local to each source.` :
             'Final mask difference appears when both analyses finish.';
-        this.comparisonView.render(views, this.comparisonCrop(root), composite(this.comparisonDifferenceOverlay), summary);
+        this.comparisonView.render(views, this.spaceComparisonCrop(root), composite(this.comparisonDifferenceOverlay), summary);
         if (root.fingerprint === this.viewFingerprint(this.getSource())) {
             const results = Object.values(root.analyses), ready = results.filter(value => value.analysisStatus === 'ready').length;
             const failed = results.some(value => value.analysisStatus === 'error');
             this.message(ready === 2 ? 'ready' : failed ? 'partial' : 'inferring',
                 `${root.frameId} · ${ready}/2 depth analyses ready${failed ? ' · inspect the source error above' : ''}`);
-            this.saveButton.disabled = this.saving || da?.analysisStatus !== 'ready';
+            this.saveButton.disabled = this.saving || da?.analysisStatus !== 'ready' || !this.spaceReady(root);
         }
         this.figuresButton.disabled = this.savingFigures || !this.canSaveFigures(root);
         // Legacy fields and exports continue to represent the DA2 analysis.
@@ -1573,7 +1907,7 @@ class LiveView {
                 'pcaMergedLabels', 'pcaMergedCount', 'pcaMergedObjects', 'pcaMergedAngle', 'pcaMergedOverlay',
                 'gravityMergedLabels', 'gravityMergedObjects', 'gravityMergedOverlay', 'gravityMergedKey',
                 'gravityEligibleCount', 'gravityComponentEligibleIds', 'gravityFilteredLabels', 'gravityFilteredOverlay',
-                'gravityFilterKey', 'finalLanding', 'finalLandingKey', 'finalLandingOverlay', 'finalLandingCpuMs'] as const;
+                'gravityFilterKey', 'finalLanding', 'finalLandingKey', 'finalLandingOverlay', 'finalLandingCpuMs', 'finalBase', 'spaceKey', 'spacePending', 'spaceCpuMs', 'spaceCalibration'] as const;
             for (const field of fields) (root as any)[field] = da[field];
             root.analysisMask = da.mask; root.depthKind = 'relative_inverse';
         }
@@ -1581,15 +1915,21 @@ class LiveView {
             this.hideMainLanding(); return;
         }
         const source = this.comparisonView.overlaySource, selected = source === 'difference' ? null : root.analyses[source];
+        const finalDisplay = selected?.analysisStatus === 'ready' && this.viewMode === 'final' ? this.visibleLanding(selected) : null;
         let overlay = source === 'difference' ? this.comparisonDifferenceOverlay : null;
         let hasContent = source === 'difference' && union > 0;
         if (selected?.analysisStatus === 'ready') overlay = this.viewMode === 'raw' ? selected.rawOverlay :
-            this.viewMode === 'final' ? selected.finalLandingOverlay : instanceCanvas(this.branchView(selected).landingMask, true);
+            finalDisplay ? finalDisplay.overlay : instanceCanvas(this.branchView(selected).landingMask, true);
         if (selected?.analysisStatus === 'ready') hasContent = this.viewMode === 'raw' ? selected.rawSkeletonCount > 0 :
-            this.viewMode === 'final' ? selected.finalLanding.selected.length > 0 : this.branchView(selected).landing.length > 0;
+            finalDisplay ? finalDisplay.result.selected.length > 0 : this.branchView(selected).landing.length > 0;
         if (!overlay) { this.hideMainLanding(); return; }
         const ctx = this.mainOverlay.getContext('2d'); ctx.clearRect(0, 0, this.mainOverlay.width, this.mainOverlay.height);
         ctx.drawImage(overlay, 0, 0, this.mainOverlay.width, this.mainOverlay.height);
+        if (selected && this.viewMode === 'final') {
+            const inspected = this.spaceCandidate(selected);
+            drawSpaceBox(ctx, inspected?.space, selected.pose.intrinsics);
+            if (inspected?.space?.geometry) hasContent = true;
+        }
         this.mainOverlay.dataset.frameId = root.frameId;
         this.mainOverlay.dataset.depthSource = source;
         this.mainOverlay.style.visibility = hasContent ? 'visible' : 'hidden';
@@ -1681,17 +2021,41 @@ class LiveView {
             return;
         }
         const ctx = this.mainOverlay.getContext('2d');
+        const display = this.visibleLanding(snapshot);
         ctx.clearRect(0, 0, this.mainOverlay.width, this.mainOverlay.height);
-        ctx.drawImage(snapshot.finalLandingOverlay, 0, 0, this.mainOverlay.width, this.mainOverlay.height);
+        ctx.drawImage(display.overlay, 0, 0, this.mainOverlay.width, this.mainOverlay.height);
         this.drawFinalMarkers(ctx, snapshot);
         this.mainOverlay.dataset.frameId = snapshot.frameId;
-        this.mainOverlay.style.visibility = snapshot.finalLanding.selected.length ? 'visible' : 'hidden';
+        this.mainOverlay.style.visibility = display.result.selected.length || this.spaceCandidate(snapshot)?.space?.geometry ? 'visible' : 'hidden';
+    }
+
+    visibleLanding(snapshot: LiveSnapshot) {
+        const result = snapshot.finalLanding;
+        if (!this.birdSpace.enabled) return { result, overlay: snapshot.finalLandingOverlay };
+        let display = clearLandingDisplays.get(result);
+        if (!display) {
+            const eligible = result.eligible.filter(candidate => candidate.space?.status === 'clear');
+            if (eligible.length === result.eligible.length) return { result, overlay: snapshot.finalLandingOverlay };
+            const selected = result.selected.filter(candidate => candidate.space?.status === 'clear');
+            const ids = landingCandidateIds(result, selected);
+            display = { result: { ...result, eligible, selected, ids }, overlay: finalLandingCanvas(ids) };
+            clearLandingDisplays.set(result, display);
+        }
+        return display;
+    }
+
+    spaceCandidate(snapshot: LiveSnapshot) {
+        if (!this.birdSpace.enabled) return;
+        const final = snapshot.finalLanding;
+        const inspected = final?.results.find(c => c.id === this.spaceInspectIds[snapshot.depthSource ?? 'da2']);
+        return inspected ? (inspected.space?.status === 'clear' ? inspected : undefined) :
+            final?.selected.find(c => c.space?.status === 'clear');
     }
 
     drawFinalMarkers(ctx: CanvasRenderingContext2D, snapshot: LiveSnapshot, crop?: { x: number; y: number; size: number }) {
         if (!snapshot.finalLanding) return;
         const source = crop ?? { x: 0, y: 0, size: 640 };
-        for (const [rank, candidate] of snapshot.finalLanding.selected.entries()) {
+        for (const [rank, candidate] of this.visibleLanding(snapshot).result.selected.entries()) {
             const x = (candidate.center_px[0] - source.x) * ctx.canvas.width / source.size;
             const y = (candidate.center_px[1] - source.y) * ctx.canvas.height / source.size;
             if (x < 0 || y < 0 || x >= ctx.canvas.width || y >= ctx.canvas.height) continue;
@@ -1704,6 +2068,8 @@ class LiveView {
             ctx.fillStyle = '#071923'; ctx.fillRect(x + 17, y - 12, 31, 24);
             ctx.fillStyle = '#ffffff'; ctx.fillText(label, x + 21, y);
         }
+        const inspected = this.spaceCandidate(snapshot);
+        drawSpaceBox(ctx, inspected?.space, snapshot.pose.intrinsics, crop);
     }
 
     comparisonCrop(snapshot: LiveSnapshot) {
@@ -1722,6 +2088,27 @@ class LiveView {
         const y = Math.max(0, Math.min(640 - size, minY + maxY + 1 - size / 2));
         snapshot.comparisonCrop = { x, y, size };
         return snapshot.comparisonCrop;
+    }
+
+    spaceComparisonCrop(root: LiveSnapshot) {
+        const crop = this.comparisonCrop(root);
+        let minX = crop.x, minY = crop.y, maxX = crop.x + crop.size, maxY = crop.y + crop.size;
+        for (const analysis of Object.values(root.analyses ?? {})) {
+            for (const candidate of analysis.finalLanding?.results ?? []) {
+                if (candidate.space?.status !== 'clear') continue;
+                for (const corner of candidate.space?.geometry?.corners_camera_m ?? []) {
+                    const pixel = projectSpacePoint(corner, analysis.pose.intrinsics);
+                    if (!pixel || pixel.some(v => v < 0 || v >= 640)) continue;
+                    minX = Math.max(0, Math.min(minX, pixel[0] - 12));
+                    minY = Math.max(0, Math.min(minY, pixel[1] - 12));
+                    maxX = Math.min(640, Math.max(maxX, pixel[0] + 12));
+                    maxY = Math.min(640, Math.max(maxY, pixel[1] + 12));
+                }
+            }
+        }
+        const size = Math.max(maxX - minX, maxY - minY);
+        return { x: Math.max(0, Math.min(640 - size, (minX + maxX - size) / 2)),
+            y: Math.max(0, Math.min(640 - size, (minY + maxY - size) / 2)), size };
     }
 
     drawComparisonLayer(ctx: CanvasRenderingContext2D, image: HTMLCanvasElement, snapshot: LiveSnapshot) {
@@ -1914,13 +2301,14 @@ class LiveView {
 
     computeGravity(snapshot: LiveSnapshot) {
         const gravity = snapshot.pose.gravity.vector as number[];
-        const mergeKey = `${this.pcaMaxAngle}:${this.gravityTolerance}:${this.requireGravityComponents}:${gravity.join(',')}`;
+        const requireComponents = this.filterGravityAngle && this.requireGravityComponents;
+        const mergeKey = `${this.pcaMaxAngle}:${this.gravityTolerance}:${requireComponents}:${gravity.join(',')}`;
         if (snapshot.gravityMergedKey !== mergeKey || !snapshot.gravityMergedLabels) {
             const eligible = new Set(snapshot.detection.pcaObjects.filter(object => object.reliable &&
                 90 - Math.acos(Math.min(1, Math.abs(object.axis.reduce((sum, value, i) =>
                     sum + value * gravity[i], 0)))) * 180 / Math.PI <= this.gravityTolerance)
                 .map(object => object.id));
-            if (this.requireGravityComponents) {
+            if (requireComponents) {
                 const merged = this.buildPcaGroups(snapshot, eligible);
                 snapshot.gravityMergedLabels = merged.labels;
                 snapshot.gravityMergedObjects = merged.objects;
@@ -1940,13 +2328,15 @@ class LiveView {
         const lengthPasses = (object: GravityObject) => snapshot.depthKind === 'camera_z_m' ?
             Number.isFinite(object.centerlineLengthCm) && object.centerlineLengthCm >= this.minSkeletonLengthCm :
             object.centerlineLengthPx >= this.minGravityLength;
-        const accepted = new Set(objects.filter(object => object.reliable &&
+        const anglePasses = (object: GravityObject) => object.reliable &&
             (90 - object.angleToGravityDeg <= this.gravityTolerance ||
-                (!this.requireGravityComponents && object.memberIds.some(id =>
-                    eligibleComponents.has(id)))) &&
-            lengthPasses(object) &&
+                (!requireComponents && object.memberIds.some(id => eligibleComponents.has(id))));
+        const accepted = new Set(objects.filter(object =>
+            (!this.filterGravityAngle || anglePasses(object)) &&
+            (!this.filterGravityLength || lengthPasses(object)) &&
             (!this.excludeGravityTrunks || !object.isTrunk)).map(object => object.id));
-        const filterKey = `${mergeKey}:${snapshot.depthKind === 'camera_z_m' ? this.minSkeletonLengthCm : this.minGravityLength}:${this.excludeGravityTrunks}`;
+        const minLength = snapshot.depthKind === 'camera_z_m' ? this.minSkeletonLengthCm : this.minGravityLength;
+        const filterKey = `${mergeKey}:${this.filterGravityAngle}:${this.filterGravityLength}:${minLength}:${this.excludeGravityTrunks}`;
         if (snapshot.gravityFilterKey !== filterKey || !snapshot.gravityFilteredLabels) {
             const labels = new Uint32Array(snapshot.gravityMergedLabels.length);
             for (let i = 0; i < labels.length; i++) {
@@ -2006,12 +2396,39 @@ class LiveView {
         this.drawFinalPanel(snapshot);
     }
 
+    finalSettings(depthKind: LiveSnapshot['depthKind'], topK: number | null) {
+        return {
+            minLengthPx: this.minGravityLength, minLinearity: this.finalMinLinearity,
+            filterMinLength: this.filterGravityLength, filterGravity: this.filterGravityAngle,
+            filterShape: this.filterLandingShape, filterDepthSpread: this.filterLandingDepthSpread,
+            filterRelativeHeight: this.filterLandingRelativeHeight,
+            minLengthCm: depthKind === 'camera_z_m' ? this.minSkeletonLengthCm : undefined,
+            minProjectedLinearity: this.finalMinProjectedLinearity,
+            minCylinderInlierFraction: this.finalMinCylinderInlier,
+            maxWidthPx: this.finalMaxWidthPx, maxDepthStdRelative: this.finalMaxDepthStdRelative,
+            minRelativeHeight: this.finalMinRelativeHeight, minWoodyFraction: this.finalMinWoodyFraction,
+            rejectFoliage: this.finalRejectFoliage,
+            maxAngleFromHorizontalDeg: this.gravityTolerance,
+            maxCenterBearingDeg: this.finalMaxCenterBearing,
+            maxEndOnDeviationDeg: this.finalMaxEndOn,
+            maxImageTiltDeg: this.finalMaxImageTilt,
+            strictCameraAngles: this.finalStrictCameraAngles, scoreCameraAngles: this.finalStrictCameraAngles,
+            excludeTrunks: this.excludeGravityTrunks, topK
+        };
+    }
+
     computeFinal(snapshot: LiveSnapshot) {
+        this.computeFinalBase(snapshot, this.limitFinalTopK ? this.finalTopK : null);
+        this.computeSpace(snapshot);
+    }
+
+    computeFinalBase(snapshot: LiveSnapshot, topK: number | null) {
         const key = `${snapshot.gravityFilterKey}:${this.finalMaxWidthPx}:${this.finalMinLinearity}:` +
             `${this.finalMinProjectedLinearity}:${this.finalMinCylinderInlier}:` +
             `${this.finalMaxDepthStdRelative}:${this.finalMinRelativeHeight}:${this.finalMinWoodyFraction}:` +
             `${this.finalRejectFoliage}:${this.finalMaxCenterBearing}:${this.finalMaxEndOn}:` +
-            `${this.finalMaxImageTilt}:${this.finalStrictCameraAngles}:${this.finalTopK}`;
+            `${this.finalMaxImageTilt}:${this.finalStrictCameraAngles}:${topK}:` +
+            `${this.filterLandingShape}:${this.filterLandingDepthSpread}:${this.filterLandingRelativeHeight}`;
         if (snapshot.finalLandingKey !== key || !snapshot.finalLanding) {
             const started = performance.now();
             const maskRgba = (snapshot.analysisMask ?? snapshot.mask).getContext('2d').getImageData(0, 0, 640, 640).data;
@@ -2022,23 +2439,71 @@ class LiveView {
                 sourceLabels: snapshot.detection.depthLinkLabels,
                 objects: snapshot.gravityMergedObjects, sourceObjects: snapshot.detection.pcaObjects,
                 mask, depth: snapshot.depth, rgb, pose: snapshot.pose, depthKind: snapshot.depthKind,
-                settings: { minLengthPx: this.minGravityLength, minLinearity: this.finalMinLinearity,
-                    minLengthCm: snapshot.depthKind === 'camera_z_m' ? this.minSkeletonLengthCm : undefined,
-                    minProjectedLinearity: this.finalMinProjectedLinearity,
-                    minCylinderInlierFraction: this.finalMinCylinderInlier,
-                    maxWidthPx: this.finalMaxWidthPx, maxDepthStdRelative: this.finalMaxDepthStdRelative,
-                    minRelativeHeight: this.finalMinRelativeHeight, minWoodyFraction: this.finalMinWoodyFraction,
-                    rejectFoliage: this.finalRejectFoliage,
-                    maxAngleFromHorizontalDeg: this.gravityTolerance,
-                    maxCenterBearingDeg: this.finalMaxCenterBearing,
-                    maxEndOnDeviationDeg: this.finalMaxEndOn,
-                    maxImageTiltDeg: this.finalMaxImageTilt,
-                    strictCameraAngles: this.finalStrictCameraAngles,
-                    excludeTrunks: this.excludeGravityTrunks, topK: this.finalTopK } });
+                settings: this.finalSettings(snapshot.depthKind, topK) });
+            snapshot.finalBase = snapshot.finalLanding;
             snapshot.finalLandingOverlay = finalLandingCanvas(snapshot.finalLanding.ids);
             snapshot.finalLandingCpuMs = performance.now() - started;
             snapshot.finalLandingKey = key;
         }
+    }
+
+    spaceReady(root = this.last) {
+        return !this.birdSpace.enabled || !!root && Object.values(root.analyses ?? {}).every(a =>
+            a.analysisStatus !== 'ready' || !!a.spaceKey && !a.spacePending);
+    }
+
+    computeSpace(snapshot: LiveSnapshot) {
+        if (!snapshot.depthSource && this.last?.analyses?.da2) return;
+        const base = snapshot.finalBase ?? snapshot.finalLanding;
+        if (!base) return;
+        if (!this.birdSpace.enabled) {
+            snapshot.spaceKey = 'disabled'; snapshot.spacePending = false;
+            snapshot.spaceCalibration = null;
+            snapshot.finalLanding = base; snapshot.finalLandingOverlay = finalLandingCanvas(base.ids);
+            return;
+        }
+        const source = snapshot.depthSource ?? 'da2';
+        const manualDA2 = source === 'da2' ? this.da2SpaceReferenceM : null;
+        const autoDA2 = source === 'da2' && manualDA2 === null;
+        const da2ReferenceM = source === 'da2' ? manualDA2 ?? 1 : undefined;
+        const metricReference = autoDA2 ? snapshot.gsDepth ?? undefined : undefined;
+        const depthKey = source === 'da2' ? manualDA2 ?? 'metric' : snapshot.pose.meters_per_scene_unit;
+        const key = `${snapshot.frameId}:${snapshot.finalLandingKey}:${JSON.stringify(this.birdSpace)}:${JSON.stringify(snapshot.pose.gravity)}:${depthKey}`;
+        if (snapshot.spaceKey === key) return;
+        snapshot.spaceKey = key;
+        snapshot.spaceCalibration = null;
+        const topK = this.limitFinalTopK ? this.finalTopK : null;
+        const unknown = (reason: string): SpaceAssessment[] => base.eligible.map((c): SpaceAssessment => ({ id: c.id,
+            status: 'unknown', reasons: [reason], approach_angle_deg: null, contact_camera_m: null,
+            min_clearance_m: null, observed_fraction: 0, geometry: null }));
+        const apply = (assessments: SpaceAssessment[]) => {
+            const pose = snapshot.pose;
+            for (const a of assessments) if (source === '3dgs' && a.contact_camera_m) {
+                a.contact_world_m = [0, 1, 2].map(row =>
+                    pose.camera_to_world[row].slice(0, 3).reduce((sum: number, value: number, col: number) =>
+                        sum + value * a.contact_camera_m[col], 0) +
+                    pose.camera_to_world[row][3] * pose.meters_per_scene_unit);
+            }
+            snapshot.finalLanding = selectSpaceCandidates(base, assessments, topK);
+            snapshot.finalLandingOverlay = finalLandingCanvas(snapshot.finalLanding.ids);
+        };
+        apply(unknown('space_pending'));
+        snapshot.spacePending = autoDA2 || base.eligible.length > 0;
+        if (!snapshot.spacePending) return;
+        const root = this.last;
+        this.saveButton.disabled = true; this.figuresButton.disabled = true;
+        const sceneKey = `${snapshot.frameId}:${depthKey}`;
+        // Comparison panels keep the captured frame while the live camera moves or is paused.
+        const isCurrent = () => this.last === root && snapshot.spaceKey === key &&
+            (!snapshot.depthSource || root.analyses[snapshot.depthSource] === snapshot);
+        this.spaceClient.assess(source, key, sceneKey, snapshot.depth,
+            snapshot.pose, base, this.birdSpace, da2ReferenceM, root.mask, metricReference, autoDA2).then(({ assessments, cpuMs, calibration }) => {
+            if (!isCurrent()) return;
+            apply(assessments); snapshot.spaceCalibration = calibration; snapshot.spacePending = false; snapshot.spaceCpuMs = cpuMs; this.queueComparisonRender();
+        }).catch((error) => {
+            if (!isCurrent()) return;
+            apply(unknown(`space_error: ${error.message}`)); snapshot.spacePending = false; this.queueComparisonRender();
+        });
     }
 
     drawFinalPanel(snapshot: LiveSnapshot) {
@@ -2063,15 +2528,15 @@ class LiveView {
         this.drawComparisonLayer(input, snapshot.gravityFilteredOverlay, snapshot);
         output.clearRect(0, 0, 640, 640);
         output.globalAlpha = 0.45; this.drawComparisonLayer(output, snapshot.rgb, snapshot); output.globalAlpha = 1;
-        this.drawComparisonLayer(output, snapshot.finalLandingOverlay, snapshot);
+        const { result, overlay } = this.visibleLanding(snapshot);
+        this.drawComparisonLayer(output, overlay, snapshot);
         this.drawFinalMarkers(output, snapshot, this.comparisonCrop(snapshot));
-        const result = snapshot.finalLanding;
         this.finalInputLabel.textContent = `Gravity filtered · ${snapshot.gravityMergedObjects.length} merged objects · zoomed`;
         this.finalOutputLabel.textContent = `Final mask · ${result.selected.length} / ${result.eligible.length} eligible shown · zoomed`;
         const ranks = result.selected.map((item, index) =>
             `#${index + 1} ID ${item.id} · center ${item.center_bearing_deg.toFixed(0)}° · ` +
             `axis toward ${item.end_on_deviation_deg.toFixed(0)}° · ` +
-            `screen ${item.image_tilt_deg.toFixed(0)}° · view fit ${Math.round(item.view_score * 100)}%`).join(' | ');
+            `screen ${item.image_tilt_deg.toFixed(0)}° · view fit ${Math.round(item.view_score * 100)}% · ${describeSpace(item.space)}`).join(' | ');
         const rejected = { height: 0, width: 0, linearity: 0, depth: 0, foliage: 0, cylinder: 0,
             offCenter: 0, endOn: 0, screenTilt: 0 };
         for (const candidate of result.results) {
@@ -2182,17 +2647,18 @@ class LiveView {
             ctx.clearRect(0, 0, 640, 640);
             ctx.globalAlpha = 0.35; ctx.drawImage(snapshot.rgb, 0, 0); ctx.globalAlpha = 1;
             if (snapshot.finalLanding) {
-                ctx.drawImage(snapshot.finalLandingOverlay, 0, 0);
+                const { result, overlay } = this.visibleLanding(snapshot);
+                ctx.drawImage(overlay, 0, 0);
                 this.drawFinalMarkers(ctx, snapshot);
                 this.branchList.replaceChildren();
                 const heading = document.createElement('div');
-                heading.textContent = `${snapshot.finalLanding.selected.length} shown / ${snapshot.finalLanding.eligible.length} eligible · gravity: ${snapshot.pose.gravity.source === 'imu' ? 'IMU' : 'scene fallback'}`;
+                heading.textContent = `${result.selected.length} shown / ${result.eligible.length} eligible · gravity: ${snapshot.pose.gravity.source === 'imu' ? 'IMU' : 'scene fallback'}`;
                 this.branchList.append(heading);
-                for (const [index, candidate] of snapshot.finalLanding.selected.entries()) {
+                for (const [index, candidate] of result.selected.entries()) {
                     const line = document.createElement('div');
                     line.textContent = `Rank ${index + 1} · ID ${candidate.id} · center ${candidate.center_bearing_deg.toFixed(0)}° · ` +
                         `axis toward ${candidate.end_on_deviation_deg.toFixed(0)}° · ` +
-                        `screen tilt ${candidate.image_tilt_deg.toFixed(0)}° · view fit ${Math.round(candidate.view_score * 100)}%`;
+                        `screen tilt ${candidate.image_tilt_deg.toFixed(0)}° · view fit ${Math.round(candidate.view_score * 100)}% · ${describeSpace(candidate.space)}`;
                     this.branchList.append(line);
                 }
                 this.drawMainFinal(snapshot);
@@ -2258,7 +2724,7 @@ class LiveView {
     }
 
     canSaveFigures(snapshot = this.last) {
-        return !!snapshot?.analyses &&
+        return this.spaceReady(snapshot) && !!snapshot?.analyses &&
             (['da2', '3dgs'] as const).every(source => ['ready', 'error'].includes(snapshot.analyses[source]?.analysisStatus)) &&
             Object.values(snapshot.analyses).some(analysis => analysis.analysisStatus === 'ready');
     }
@@ -2297,7 +2763,7 @@ class LiveView {
             `Displayed crop: x ${crop.x.toFixed(1)}, y ${crop.y.toFixed(1)}, size ${crop.size.toFixed(1)}. ` +
             `Depth gap ${this.depthGapThreshold}; PCA angle ${this.pcaMaxAngle}°; gravity tolerance ${this.gravityTolerance}°; ` +
             `minimum skeleton: DA2 ${this.minGravityLength} px / 3DGS ${this.minSkeletonLengthCm} cm; ` +
-            `final Top K ${this.finalTopK}. ` +
+            `final Top K ${this.limitFinalTopK ? this.finalTopK : 'off'}. ` +
             (reference ? `3DGS calibration: BBox ${reference.box_id} ${reference.axis} = ${reference.actual_length_m * 100} cm.` :
                 `3DGS scale: ${snapshot.pose.meters_per_scene_unit} m per scene unit (approximate).`);
         this.savingFigures = true;
@@ -2336,6 +2802,7 @@ class LiveView {
     async save() {
         const snapshot = this.last;
         if (this.saving || !this.enabled || !snapshot?.depth || !snapshot.gsDepth || !snapshot.detection ||
+            !this.spaceReady(snapshot) ||
             snapshot.fingerprint !== this.viewFingerprint(this.getSource())) {
             throw new Error('Wait for the current frame and branch detection to finish');
         }
@@ -2358,12 +2825,20 @@ class LiveView {
                 landing_ids: `Landing/${prefix}_ids.npy`,
                 landing_preview: `Landing/${prefix}_preview.png`,
                 landing_analysis: `Landing/${prefix}.json` };
+            const extraNames = { gs_landing_ids: `Landing/${prefix}_3dgs_ids.npy`,
+                gs_landing_analysis: `Landing/${prefix}_3dgs.json` };
             if (!folder) {
                 Object.keys(names).forEach((key) => {
                     names[key as keyof typeof names] = names[key as keyof typeof names].replace('/', '_');
                 });
+                Object.keys(extraNames).forEach(key => { extraNames[key as keyof typeof extraNames] = extraNames[key as keyof typeof extraNames].replace('/', '_'); });
             }
-            const pose = { ...snapshot.pose, files: names };
+            if (snapshot !== this.last || snapshot.fingerprint !== this.viewFingerprint(this.getSource()) || !this.spaceReady(snapshot)) {
+                throw new Error('View or space settings changed; wait for the current analysis');
+            }
+            const da2Calibration = snapshot.spaceCalibration ?? null;
+            const pose = { ...snapshot.pose, bird_space: { ...this.birdSpace, da2_calibration: da2Calibration },
+                files: { ...names, ...extraNames } };
             const view = this.branchView(snapshot);
             this.drawFinalPanel(snapshot);
             const final = snapshot.finalLanding;
@@ -2381,11 +2856,21 @@ class LiveView {
                 landing_candidate_ids: view.landing.map(branch => branch.id),
                 branches: view.branches, junctions_px: snapshot.detection.junctions,
                 files: names };
+            const spaceFilter = { ...this.birdSpace, shape: 'oriented_box', robot_reference: 'camera',
+                landing_check: 'upper_corners', corner_probe_radius_m: cornerProbeRadiusM,
+                corner_min_hit_pixels: cornerMinHitPixels, unknown_policy: 'warn_keep' };
             const landing = { frame_id: snapshot.frameId, captured_at_utc: snapshot.pose.captured_at_utc,
+                depth_source: 'da2',
                 width: 640, height: 640, id_map: 'uint32 NPY; zero is background; nonzero values are junction-split DA2 link IDs',
                 depth_units: snapshot.depthInfo.units, gravity: snapshot.pose.gravity,
                 final_cpu_ms: snapshot.finalLandingCpuMs,
-                filters: { max_gravity_deviation_deg: this.gravityTolerance,
+                space_cpu_ms: snapshot.spaceCpuMs ?? null,
+                filters: { filter_gravity_angle: this.filterGravityAngle,
+                    filter_minimum_length: this.filterGravityLength,
+                    filter_branch_shape: this.filterLandingShape,
+                    filter_depth_spread: this.filterLandingDepthSpread,
+                    filter_relative_height: this.filterLandingRelativeHeight,
+                    max_gravity_deviation_deg: this.gravityTolerance,
                     require_each_component_horizontal: this.requireGravityComponents,
                     merge_max_axis_angle_deg: this.pcaMaxAngle, min_centerline_length_px: this.minGravityLength,
                     exclude_trunks: this.excludeGravityTrunks, min_linearity: this.finalMinLinearity,
@@ -2401,9 +2886,23 @@ class LiveView {
                     max_camera_end_on_deviation_deg: this.finalMaxEndOn,
                     min_camera_side_on_deg: 90 - this.finalMaxEndOn,
                     max_camera_image_tilt_deg: this.finalMaxImageTilt,
-                    top_k: this.finalTopK },
+                    limit_top_k: this.limitFinalTopK, top_k: this.finalTopK },
+                space_filter: { ...spaceFilter, geometry_units: da2Calibration ?
+                    da2Calibration.method === 'assumed_median' ? 'da2_assumed_meters' : 'da2_calibrated_meters' : null,
+                calibration: da2Calibration,
+                height_reference: da2Calibration && da2Calibration.method !== 'assumed_median' ? snapshot.pose.height_reference ?? null : null },
                 selected_ids: final.selected.map(candidate => candidate.id),
                 candidates: final.results, files: names };
+            const gs = snapshot.analyses?.['3dgs'];
+            const gsLanding = { ...landing, depth_source: '3dgs', depth_units: 'approximate_meters',
+                space_filter: { ...spaceFilter, geometry_units: 'approximate_meters', meters_per_scene_unit: snapshot.pose.meters_per_scene_unit,
+                    scale_reference: snapshot.pose.gs_depth?.scale_reference ?? null, height_reference: snapshot.pose.height_reference ?? null },
+                final_cpu_ms: gs?.finalLandingCpuMs ?? null, space_cpu_ms: gs?.spaceCpuMs ?? null,
+                id_map: 'uint32 NPY; zero is background; IDs are source-local 3DGS links, not DA2 correspondences',
+                analysis_status: gs?.analysisStatus ?? 'error', analysis_error: gs?.analysisError ?? null,
+                filters: { ...landing.filters, min_centerline_length_cm: this.minSkeletonLengthCm },
+                selected_ids: gs?.finalLanding?.selected.map(c => c.id) ?? [],
+                candidates: gs?.finalLanding?.results ?? [], files: { ...names, ...extraNames } };
             const landingPreview = document.createElement('canvas');
             landingPreview.width = landingPreview.height = 640;
             const landingCtx = landingPreview.getContext('2d');
@@ -2423,6 +2922,9 @@ class LiveView {
                 { name: `${prefix}_preview.png`, group: 5, blob: await pngBlob(landingPreview) },
                 { name: `${prefix}.json`, group: 5, blob: new Blob([JSON.stringify(landing, null, 2)], { type: 'application/json' }) }
             ];
+            files.push({ name: `${prefix}_3dgs_ids.npy`, group: 5,
+                blob: new Blob([numpyUint32(gs?.finalLanding?.ids ?? new Uint32Array(640 * 640), 640, 640).buffer], { type: 'application/octet-stream' }) },
+            { name: `${prefix}_3dgs.json`, group: 5, blob: new Blob([JSON.stringify(gsLanding, null, 2)], { type: 'application/json' }) });
             for (const file of files) {
                 const name = folder ? file.name : `${groupNames[file.group]}_${file.name}`;
                 await this.writeFile(name, file.blob, groups[file.group]);

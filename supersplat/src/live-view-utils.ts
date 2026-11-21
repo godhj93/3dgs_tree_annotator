@@ -1,6 +1,19 @@
 export type BoxScaleReference = { source: 'bbox'; box_id: string; axis: 'X' | 'Y' | 'Z';
     scene_length: number; actual_length_m: number };
 
+export type HeightScaleReference = { source: 'tree_height'; actual_height_m: number; scene_height: number;
+    points_scene: number[][]; gravity_world: number[] };
+export const parseHeightScaleReference = (value: any, metersPerSceneUnit: number): HeightScaleReference | null => {
+    const vector = (v: any) => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
+    if (!value || value.source !== 'tree_height' || !Number.isFinite(metersPerSceneUnit) || metersPerSceneUnit <= 0 ||
+        !Number.isFinite(value.actual_height_m) || value.actual_height_m <= 0 || !Number.isFinite(value.scene_height) || value.scene_height <= 0 ||
+        !Array.isArray(value.points_scene) || value.points_scene.length !== 2 || !value.points_scene.every(vector) ||
+        !vector(value.gravity_world) || Math.hypot(...value.gravity_world) < 1e-9 ||
+        Math.abs(value.actual_height_m / value.scene_height - metersPerSceneUnit) > Math.max(1e-9, metersPerSceneUnit * 1e-6)) return null;
+    return { source: 'tree_height', actual_height_m: value.actual_height_m, scene_height: value.scene_height,
+        points_scene: value.points_scene.map((p: number[]) => [...p]), gravity_world: [...value.gravity_world] };
+};
+
 export const parseBoxScaleReference = (value: any, metersPerSceneUnit: number): BoxScaleReference | null => {
     if (!Number.isFinite(metersPerSceneUnit) || metersPerSceneUnit <= 0 ||
         !value || value.source !== 'bbox' || typeof value.box_id !== 'string' || !value.box_id.trim() ||

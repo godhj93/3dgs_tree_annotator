@@ -7,6 +7,7 @@ import { Scene } from '../scene';
 import { Splat } from '../splat';
 import { Transform } from '../transform';
 import { i18n } from '../ui/localization';
+import { projectedHeight } from '../../static/lib/branch-detector/landing-space-analysis.mjs';
 
 const mat = new Mat4();
 const mat1 = new Mat4();
@@ -119,6 +120,14 @@ class MeasureTool {
         selectToolbar.append(rawLabel);
         selectToolbar.append(rawLengthInput);
         selectToolbar.append(applyScaleButton);
+        const heightInput = new NumericInput({ width: 65, precision: 2, min: 0.01, value: 3 });
+        heightInput.dom.title = 'Known tree height in meters, from the base to the highest point.';
+        heightInput.dom.setAttribute('aria-label', 'Tree height meters');
+        const heightButton = new Button({ text: 'Apply Tree Height', class: 'select-toolbar-button' });
+        heightButton.enabled = false;
+        heightButton.dom.title = 'Calibrate the gravity-axis height between the two picked points, not their diagonal distance.';
+        selectToolbar.append(new Label({ text: 'Tree height (m)' }));
+        selectToolbar.append(heightInput); selectToolbar.append(heightButton);
         canvasContainer.append(selectToolbar);
 
         const gizmo = new TranslateGizmo(scene.camera.camera, scene.gizmoLayer);
@@ -139,6 +148,21 @@ class MeasureTool {
             result.x *= canvasContainer.dom.clientWidth;
             result.y *= canvasContainer.dom.clientHeight;
         };
+        heightButton.on('click', () => {
+            if (!splat || splat.measurePoints.length !== 2) return;
+            getPoint(0, p0); getPoint(1, p1);
+            const gravity = events.invoke('annotation.liveSnapshot')?.pose?.gravity?.vector ??
+                (scene.camera.upAxis === 'z' ? [0, 0, -1] : [0, -1, 0]);
+            const a = [p0.x, p0.y, p0.z], b = [p1.x, p1.y, p1.z];
+            const sceneHeight = projectedHeight(a, b, gravity.map((v: number) => -v));
+            const actual = Number(heightInput.value);
+            if (!Number.isFinite(actual) || actual <= 0 || sceneHeight <= 1e-6) return;
+            events.fire('metric.scale.set', actual / sceneHeight, 'height calibration', {
+                source: 'tree_height', actual_height_m: actual, scene_height: sceneHeight,
+                points_scene: [a, b], gravity_world: gravity
+            });
+            updateVisuals();
+        });
 
         const updateVisuals = () => {
             gizmo.detach();
@@ -156,6 +180,9 @@ class MeasureTool {
                 getPoint(1, p1);
                 const len = p0.distance(p1);
                 measuredSceneLength = len;
+                const gravity = events.invoke('annotation.liveSnapshot')?.pose?.gravity?.vector ??
+                    (scene.camera.upAxis === 'z' ? [0, 0, -1] : [0, -1, 0]);
+                heightButton.enabled = projectedHeight([p0.x, p0.y, p0.z], [p1.x, p1.y, p1.z], gravity.map((v: number) => -v)) > 1e-6;
 
                 suppressUI++;
                 lengthInput.value = len * metricScale(events);
@@ -170,6 +197,7 @@ class MeasureTool {
                 lengthInput.enabled = false;
                 rawLengthInput.enabled = false;
                 applyScaleButton.enabled = false;
+                heightButton.enabled = false;
             }
         };
 

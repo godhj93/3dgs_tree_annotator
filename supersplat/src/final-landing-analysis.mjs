@@ -29,8 +29,9 @@ const principalAxis = (n, sum, outer) => {
 
 const projectedLine = s => {
     const n = s.woodPx;
-    if (n < 6) return { axis: [1, 0], linearity: 0, center: [0, 0] };
+    if (!n) return { axis: [1, 0], linearity: 0, center: [0, 0] };
     const cx = s.xSum / n, cy = s.ySum / n;
+    if (n < 6) return { axis: [1, 0], linearity: 0, center: [cx, cy] };
     const xx = s.xxSum / n - cx * cx, yy = s.yySum / n - cy * cy;
     const xy = s.xySum / n - cx * cy;
     const angle = Math.atan2(2 * xy, xx - yy) / 2;
@@ -67,6 +68,8 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
         throw new Error('Final landing segmentation expects aligned 320/640 inputs');
     }
     const byId = new Map(sourceObjects.map(object => [object.id, object]));
+    const filterShape = settings.filterShape !== false;
+    const rejectFoliage = settings.rejectFoliage !== false;
     const stats = new Map();
     const depthSamples = [];
     let sampled = 0;
@@ -103,7 +106,7 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
         }
         s.areaPx++;
         const r = rgb[p * 4], g = rgb[p * 4 + 1], b = rgb[p * 4 + 2];
-        if (settings.rejectFoliage !== false && isGreenFoliage(r, g, b)) continue;
+        if (rejectFoliage && isGreenFoliage(r, g, b)) continue;
         s.woodPx++;
         s.pixels.push(p);
         s.xSum += x; s.ySum += y; s.xxSum += x * x; s.yySum += y * y; s.xySum += x * y;
@@ -120,7 +123,7 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
     const heightLow = allHeights[Math.floor(allHeights.length * 0.05)] ?? 0;
     const heightHigh = allHeights[Math.floor(allHeights.length * 0.95)] ?? heightLow;
     const heightRange = Math.max(heightHigh - heightLow, 1e-6);
-    const results = [], eligiblePixels = new Map();
+    const results = [], eligiblePixels = new Map(), supportPixels = new Map();
     for (const [id, s] of stats) {
         const object = byId.get(id);
         const fit = principalAxis(s.woodPx, s.sum3, s.outer3);
@@ -176,30 +179,32 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
         const isTrunk = object.isTrunk ?? (object.trunkCenterlineLengthPx >= 6 &&
             object.trunkCenterlineLengthPx / Math.max(1, centerlineLengthPx) >= 0.35);
         const reasons = [];
-        if (!s.areaPx || !fit.reliable) reasons.push('unreliable');
-        if (woodFraction < (settings.minWoodyFraction ?? 0.25)) reasons.push('foliage');
+        if (filterShape && !fit.reliable) reasons.push('unreliable');
+        if (rejectFoliage && (!s.woodPx || woodFraction < (settings.minWoodyFraction ?? 0.25))) reasons.push('foliage');
         const tooShort = depthKind === 'camera_z_m' && settings.minLengthCm !== undefined ?
             !Number.isFinite(centerlineLengthCm) || centerlineLengthCm < settings.minLengthCm :
             centerlineLengthPx < settings.minLengthPx || fittedLengthPx < settings.minLengthPx * 0.5;
-        if (tooShort) reasons.push('short');
-        if (fit.linearity < settings.minLinearity ||
-            line.linearity < (settings.minProjectedLinearity ?? 0.65)) reasons.push('low_linearity');
-        if (apparentWidthPx > settings.maxWidthPx || cylinderWidthPx > settings.maxWidthPx) reasons.push('wide');
-        if (corridorFraction < (settings.minCylinderInlierFraction ?? 0.65) ||
-            coverage < 0.5 || longestGap > 2) reasons.push('not_cylindrical');
-        if (angleFromHorizontalDeg > (settings.maxAngleFromHorizontalDeg ?? 90)) reasons.push('tilted');
+        if (settings.filterMinLength !== false && tooShort) reasons.push('short');
+        if (filterShape) {
+            if (fit.linearity < settings.minLinearity ||
+                line.linearity < (settings.minProjectedLinearity ?? 0.65)) reasons.push('low_linearity');
+            if (apparentWidthPx > settings.maxWidthPx || cylinderWidthPx > settings.maxWidthPx) reasons.push('wide');
+            if (corridorFraction < (settings.minCylinderInlierFraction ?? 0.65) ||
+                coverage < 0.5 || longestGap > 2) reasons.push('not_cylindrical');
+        }
+        if (settings.filterGravity !== false && angleFromHorizontalDeg > (settings.maxAngleFromHorizontalDeg ?? 90)) reasons.push('tilted');
         if (settings.strictCameraAngles) {
             if (centerBearingDeg > (settings.maxCenterBearingDeg ?? 90)) reasons.push('off_center');
             if (endOnDeviationDeg > (settings.maxEndOnDeviationDeg ?? 90)) reasons.push('end_on');
             if (imageTiltDeg > (settings.maxImageTiltDeg ?? 90)) reasons.push('screen_tilt');
         }
-        if (depthStdRelative > settings.maxDepthStdRelative) reasons.push('depth_spread');
-        if (relativeHeight < settings.minRelativeHeight) reasons.push('low_height');
+        if (settings.filterDepthSpread !== false && depthStdRelative > settings.maxDepthStdRelative) reasons.push('depth_spread');
+        if (settings.filterRelativeHeight !== false && relativeHeight < settings.minRelativeHeight) reasons.push('low_height');
         if (settings.excludeTrunks && isTrunk) reasons.push('trunk');
         // The camera controls are preferences by default: a poor view scores
         // lower but does not make the whole segmentation disappear.
         const preference = (angle, allowance) => 1 / (1 + (angle / Math.max(1, allowance)) ** 2);
-        const viewScore = 0.15 + 0.85 *
+        const viewScore = settings.scoreCameraAngles === false ? 1 : 0.15 + 0.85 *
             preference(centerBearingDeg, settings.maxCenterBearingDeg ?? 90) *
             preference(endOnDeviationDeg, settings.maxEndOnDeviationDeg ?? 90) *
             preference(imageTiltDeg, settings.maxImageTiltDeg ?? 90);
@@ -223,12 +228,13 @@ export const segmentFinalLanding = ({ labels, sourceLabels = labels, objects,
             mean_depth: meanDepth,
             mean_rgb: s.rgbSum.map(sum => Math.round(sum / Math.max(1, s.woodPx))),
             is_trunk: isTrunk, score: Number.isFinite(score) ? score : 0, reasons });
-        if (!reasons.length) eligiblePixels.set(id, corridor);
+        if (!reasons.length) { eligiblePixels.set(id, filterShape ? corridor : s.pixels); supportPixels.set(id, s.pixels); }
     }
     const eligible = results.filter(result => !result.reasons.length)
         .sort((a, b) => b.score - a.score || a.id - b.id);
-    const selected = eligible.slice(0, clamp(Math.round(settings.topK), 1, 253));
+    const selected = settings.topK == null ? eligible : eligible.slice(0, clamp(Math.round(settings.topK), 1, 253));
     const ids = new Uint32Array(FULL * FULL);
     for (const candidate of selected) for (const p of eligiblePixels.get(candidate.id)) ids[p] = candidate.id;
-    return { ids, results, eligible, selected, depthRange, heightLow, heightHigh };
+    return { ids, results, eligible, selected, depthRange, heightLow, heightHigh,
+        candidatePixels: eligiblePixels, supportPixels };
 };

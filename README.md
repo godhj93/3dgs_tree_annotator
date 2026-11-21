@@ -101,28 +101,26 @@ explicitly select either convention.
   PCA and final geometry use approximate meters, without DA2's inverse mapping
   or image-tangent fallback. Both depth previews use robust percentile colors;
   multiplying the 3DGS scale changes coordinates, not the normalized colors.
-- Expand **Shared PCA, gravity and landing filters** to adjust both paths
-  together. PCA uses the same maximum axis angle (default 20°) and normalized
-  depth-gap condition. All member axes must agree before adjacent regions
-  merge. Gravity accepts a merged axis or a reliable component within 20° of
-  horizontal by default; **Require each component horizontal** applies the
-  stricter gate. Minimum skeleton length is 12 image pixels for DA2 and 10 cm for 3DGS; **Exclude trunks**
-  is off by default. These controls use cached depths and do not rerun DA2.
+- Each comparison stage shows its own controls. Set the depth gap at **Depth
+  support** and the maximum axis angle (default 20°) at **PCA merged regions**.
+  All member axes must agree before adjacent regions merge. At **Gravity / length
+  / trunk filter**, set the deviation from horizontal (default 20°), require
+  each PCA component to pass, adjust minimum skeleton lengths (12 px for DA2 and
+  10 cm for 3DGS), or exclude trunks. These filters start enabled and use cached
+  depths.
 - 3DGS skeleton length is a visible 3D arc length in cm: backproject the
   depth at each skeleton node with the captured intrinsics, sum each undirected
   connection once, and avoid diagonal shortcuts at corners. Missing depth is
   not bridged. Skeleton and final-branch captions show cm, and hovering over a
   skeleton/region shows that link's length. Merged-region lengths sum their
   component links. DA2 does not receive an invented cm conversion.
-- The final stage preserves source junction-link IDs and applies the existing
-  landing criteria independently: maximum apparent width 24px, minimum 3D
-  linearity 0.5, image linearity 0.6, cylinder inlier fraction 0.4, maximum
-  relative depth spread 0.3, minimum relative height 0.1, non-green fraction
-  0.25, and Top K 3. Green foliage rejection is on. Camera approach allowances
-  are 30° for center bearing, end-on deviation, and screen tilt; they affect
-  ranking unless **Require angles** is checked. Angle/ratio/projected-width thresholds
-  are shared. Skeleton length has separate DA2-pixel and 3DGS-cm controls. Hover over
-  either final image to see its source ID and rejection reasons.
+- Under **Finding landing branches**, expand **가지 형상·시점 필터 · 공간 필터 전**
+  to enable branch shape, depth spread, relative height, foliage, or camera
+  angle checks, all enabled by default. The camera limits start at 30° for
+  center bearing, 90° for axis toward camera, and 30° for screen tilt. The stage
+  preserves source junction-link IDs. **Final landing branches** limits the
+  displayed candidates to Top K by default. Hover over either final image to
+  see its source ID and rejection reasons.
 - Final mask difference uses white for overlap, cyan for DA2-only, and magenta
   for 3DGS-only pixels. IoU measures mask overlap, not accuracy against ground
   truth. Two empty masks are explicitly reported. **Main overlay** selects
@@ -183,14 +181,15 @@ explicitly select either convention.
   as PNG, including stages below the scroll position. It exports RGB,
   the displayed segmentation, both depth previews, both sources' depth support,
   skeleton, separated regions, PCA axes, merged regions, gravity-filtered regions,
-  final branches, and the final difference view (19 individual 640×640 PNGs).
+  branches before and after the space filter, final branches, and the final
+  difference view (23 individual 640×640 PNGs).
   `overview.png` adds a two-column comparison with titles, captions, frame ID,
   current crop, calibration and filter values. The displayed zoom, colors and
   overlays are captured at button-click time before the folder chooser opens.
   Saving also works for a paused analysis; each image belongs to the captured
   analysis frame. The files go under `Figures/<frame>_figures_<timestamp>/` in
   the chosen output folder. If browser directory access is unavailable, one ZIP
-  download contains the same 20 PNG files. A cancelled folder chooser saves no
+  download contains the same 24 PNG files. A cancelled folder chooser saves no
   files. The button becomes available after both sources finish or report an
   error and at least one source has a result.
 - `Save DA2 Set` becomes available after the current frame's DA2 depth and
@@ -242,6 +241,41 @@ Create a fixture from a saved set using
 then run `./branch_detector/build/benchmark /tmp/frame.bin`. On either target
 board, `NATIVE_ONLY=1 ./branch_detector/build.sh` builds the same CPU core
 without requiring a WebAssembly toolchain.
+
+### Bird landing space
+
+Use **Finding landing branches** to jump to the before/after views for DA2 and
+3DGS. Each pair uses the same frame, crop, and branch colors. The before view
+shows every branch that reaches the space filter. The after view and final mask
+show only candidates that pass the enabled space checks. The after view reports
+counts for clear, unknown, and blocked candidates. Hover over a branch to inspect
+its assessment. The final results appear below these views.
+
+**물리적 공간 필터 · 위쪽 꼭짓점** places a box above the 3D centroid of each
+source's segmented branch. It follows gravity and points horizontally from the
+camera toward the branch. The default body is 10 × 10 × 10 cm, with 5 cm of
+clearance on its sides and top. The base stays at the branch centroid. Each
+upper corner uses a 2 cm neighborhood, and three or more depth pixels in that
+neighborhood mark the corner as blocked. Passing candidates have a green box.
+Hover on a branch in **공간 필터 전** to inspect its assessment and see the box
+if it passed.
+
+Each test uses its own source's depth for the centroid and surrounding obstacles.
+DA2 automatically fits its inverse-depth values to the current calibrated 3DGS
+depth at corresponding pixels, prioritizing visible annotation pixels. Applying
+the 3 m tree-height reference sets the metric scale for both. The optional
+manual DA2 median-distance field takes precedence when filled. The panel shows
+the solid inspection box dimensions and the dashed approach distance separately.
+
+**접근 통로 검사** adds a continuous collision check over the final straight
+approach (1 m when enabled). **최소 접근각 검사** independently requires a
+reliable branch axis at least 60° from the approach direction. Both are enabled
+by default. The corridor appears for passing candidates when enabled. The
+controls reuse the captured depths.
+
+For the 3 m tree-height assumption, use the Measurement tool to pick the tree base and top, enter **3** beside **Apply Tree Height**, and click that button. It uses their gravity-axis height rather than diagonal distance. Height calibration persists in the URL and 3D annotation metadata, and is recorded in Pose JSON. Do not substitute a small branch BBox for the height of the whole tree.
+
+Existing DA2 Landing filenames remain unchanged. Additional `Landing/*_3dgs.json` and `Landing/*_3dgs_ids.npy` files store the independently filtered 3DGS result. JSON records the box settings, scale reference, metric contact, approach angle, clearance diagnostics, and clear/blocked/unknown status. IDs are local to each depth source. Saves wait for the current space analysis to finish.
 
 ### Validation
 

@@ -5,7 +5,15 @@ import ts from '../supersplat/node_modules/typescript/lib/typescript.js';
 
 const source = readFileSync(new URL('../supersplat/src/live-view-utils.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText;
-const { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32, numpyUint32, parseBoxScaleReference } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { SENSOR_PROFILE, sensorIntrinsics, visibleMask, rowMajorMatrix, numpyFloat32, numpyUint32, parseBoxScaleReference, parseHeightScaleReference } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+
+test('tree height reference is restored only with finite points and the matching metric scale', () => {
+    const ref = {source:'tree_height', actual_height_m:3, scene_height:2, points_scene:[[0,0,0],[1,1,2]], gravity_world:[0,0,-1]};
+    assert.deepEqual(parseHeightScaleReference(ref,1.5),ref);
+    assert.equal(parseHeightScaleReference(ref,1),null);
+    assert.equal(parseHeightScaleReference({...ref,gravity_world:[0,0,0]},1.5),null);
+    assert.equal(parseHeightScaleReference({...ref,points_scene:[[0,0,0],[0,NaN,2]]},1.5),null);
+});
 
 test('BBox scale reference is accepted only when it agrees with the applied 3DGS scale', () => {
     const reference = { source:'bbox',box_id:'branch_001',axis:'X',scene_length:.25,actual_length_m:.5 };

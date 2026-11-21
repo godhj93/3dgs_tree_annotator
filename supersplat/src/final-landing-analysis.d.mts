@@ -1,3 +1,4 @@
+import type { SpaceAssessment } from '../static/lib/branch-detector/landing-space-analysis.mjs';
 export type GravitySample = { frame: 'camera' | 'world'; vector: [number, number, number]; captured_at_utc?: string };
 export type GravityResult = { vector: number[]; source: 'scene_up' | 'imu'; frame?: 'camera' | 'world'; captured_at_utc?: string | null };
 export type FinalLandingSettings = { minLengthPx: number; minLengthCm?: number; minLinearity: number; maxWidthPx: number;
@@ -5,8 +6,10 @@ export type FinalLandingSettings = { minLengthPx: number; minLengthCm?: number; 
     minProjectedLinearity?: number; minCylinderInlierFraction?: number;
     rejectFoliage?: boolean; maxAngleFromHorizontalDeg?: number;
     maxCenterBearingDeg?: number; maxEndOnDeviationDeg?: number; maxImageTiltDeg?: number;
-    strictCameraAngles?: boolean;
-    excludeTrunks: boolean; topK: number };
+    filterShape?: boolean; filterMinLength?: boolean; filterGravity?: boolean;
+    filterDepthSpread?: boolean; filterRelativeHeight?: boolean;
+    strictCameraAngles?: boolean; scoreCameraAngles?: boolean;
+    excludeTrunks: boolean; topK: number | null };
 export type FinalLandingObject = { id: number; centerlineLengthPx: number; reliable: boolean;
     centerlineLengthCm?: number | null;
     linearity: number; angleToGravityDeg?: number | null; isTrunk?: boolean;
@@ -23,10 +26,11 @@ export type FinalLandingCandidate = { id: number; merged_id: number; area_px: nu
     side_on_deg: number; end_on_deviation_deg: number;
     image_tilt_deg: number; view_score: number;
     relative_depth_std: number; relative_height: number; mean_relative_depth: number; mean_rgb: number[];
-    is_trunk: boolean; score: number; reasons: string[] };
+    is_trunk: boolean; score: number; reasons: string[]; space?: SpaceAssessment };
 export type FinalLandingResult = { ids: Uint32Array; results: FinalLandingCandidate[];
     eligible: FinalLandingCandidate[]; selected: FinalLandingCandidate[];
-    depthRange: number; heightLow: number; heightHigh: number };
+    depthRange: number; heightLow: number; heightHigh: number;
+    candidatePixels: Map<number, number[]>; supportPixels: Map<number, number[]> };
 export function resolveGravityWorld(sample: GravitySample | null, pose: {
     world_up_axis: string; camera_to_world: number[][] }): GravityResult;
 export function segmentFinalLanding(input: { labels: Uint32Array; sourceLabels?: Uint32Array;
