@@ -380,16 +380,15 @@ try {
 
     // Save every displayed figure without re-inference or any folder access.
     // Change the canvases immediately after the click to test frozen pixels.
-    const figureStart=await evaluate(`(async()=>{
+    const figureStart=await evaluate(`(()=>{
         const p=scene.events.invoke('annotation.panel'),l=p.liveView;
         const toggle=document.querySelector('.live-controls input[type="checkbox"]');
         toggle.checked=false;toggle.dispatchEvent(new Event('change'));
         window._qaFigureToggle=toggle;window._qaFolderCalls=0;
-        window._qaFigureHash=async canvas=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',
-            canvas.getContext('2d').getImageData(0,0,canvas.width,canvas.height).data))).map(x=>x.toString(16).padStart(2,'0')).join('');
-        window._qaFigureExpected={};
-        for(const figure of l.collectFigures()) window._qaFigureExpected[figure.name+'.png']={
-            hash:await window._qaFigureHash(figure.canvas),width:figure.canvas.width,height:figure.canvas.height};
+        window._qaFigurePixels=canvas=>canvas.getContext('2d').getImageData(0,0,canvas.width,canvas.height).data;
+        window._qaFigureExpected=Object.fromEntries(l.collectFigures().map(({name,canvas})=>[
+            name+'.png',{pixels:window._qaFigurePixels(canvas),width:canvas.width,height:canvas.height}
+        ]));
         window._qaFigureChoose=l.chooseOutputFolder;window._qaFigureWrite=l.writeFile;
         window._qaFigureFolder=p.outputDirHandle;
         const denied=async()=>{window._qaFolderCalls++;throw new DOMException('Blocked folder','SecurityError');};
@@ -426,7 +425,17 @@ try {
             const expected=window._qaFigureExpected[file.name];
             if(expected){const canvas=document.createElement('canvas');canvas.width=image.width;canvas.height=image.height;
                 canvas.getContext('2d').drawImage(image,0,0);
-                if(image.width!==expected.width||image.height!==expected.height||await window._qaFigureHash(canvas)!==expected.hash)failed.push(file.name);
+                const pixels=window._qaFigurePixels(canvas);
+                let max=0,count=0,alpha=0;
+                for(let i=0;i<pixels.length;i++){
+                    const delta=Math.abs(pixels[i]-expected.pixels[i]);if(!delta)continue;
+                    max=Math.max(max,delta);count++;if(i%4===3)alpha++;
+                }
+                // Chromium can round a few RGB samples by one level when
+                // converting translucent canvas pixels through PNG.
+                if(image.width!==expected.width||image.height!==expected.height||alpha||max>1||count>pixels.length/10000){
+                    failed.push({name:file.name,max,count,alpha});
+                }
             }else if(file.name==='overview.png') overview={width:image.width,height:image.height};
             image.close();
         }
