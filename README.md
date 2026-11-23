@@ -185,13 +185,11 @@ explicitly select either convention.
   difference view (23 individual 640×640 PNGs).
   `overview.png` adds a two-column comparison with titles, captions, frame ID,
   current crop, calibration and filter values. The displayed zoom, colors and
-  overlays are captured at button-click time before the folder chooser opens.
+  overlays are captured at button-click time before PNG encoding begins.
   Saving also works for a paused analysis; each image belongs to the captured
-  analysis frame. The files go under `Figures/<frame>_figures_<timestamp>/` in
-  the chosen output folder. If browser directory access is unavailable, one ZIP
-  download contains the same 24 PNG files. A cancelled folder chooser saves no
-  files. The button becomes available after both sources finish or report an
-  error and at least one source has a result.
+  analysis frame. The browser downloads all 24 PNG files together as
+  `<frame>_figures_<timestamp>.zip`. The button becomes available after both
+  sources finish or report an error and at least one source has a result.
 - `Save DA2 Set` becomes available after the current frame's DA2 depth and
   branch detection finish, including when only the 3DGS analysis has failed.
   Choose a folder to save `RGB/*.png`, `Mask/*.png`, `Depth/*.npy`,

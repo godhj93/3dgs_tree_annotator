@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { defaultBirdSpace, buildSpaceScene, assessSpaceBox, birdBoxGeometry,
-    sweptBoxInterval, selectSpaceCandidates, projectedHeight, evaluateLandingSpace } from '../supersplat/static/lib/branch-detector/landing-space-analysis.mjs';
+    sweptBoxInterval, selectSpaceCandidates, projectedHeight, evaluateLandingSpace,
+    defaultMinimumBranchDiameterM, evaluateBranchDiameters, selectDiameterCandidates } from '../supersplat/static/lib/branch-detector/landing-space-analysis.mjs';
 
 const contact = [0, -1, -3], up = [0, 1, 0], axis = [1, 0, 0];
 const poseOnly = { ...defaultBirdSpace, checkApproachPath: false, checkApproachAngle: false };
@@ -22,6 +23,39 @@ const assess = (points = [], extra = {}) => assessSpaceBox({ scene: scene(points
 test('the default profile enables both approach checks', () => {
     assert.equal(defaultBirdSpace.checkApproachPath, true);
     assert.equal(defaultBirdSpace.checkApproachAngle, true);
+});
+
+test('metric diameter measures the transverse silhouette and rejects a thin branch before top K', () => {
+    assert.equal(defaultMinimumBranchDiameterM, 0.05);
+    const k = [800, 800, 128, 128], depth = flatDepth(2);
+    const mask = new Uint8Array(depth.length);
+    const supportPixels = new Map([[1, []], [2, []]]);
+    const candidates = [{ id: 1, center_px: [128, 80], score: 10, reasons: [] },
+        { id: 2, center_px: [128, 160], score: 1, reasons: [] }];
+    for (const [id, v, diameter] of [[1, 80, 0.04], [2, 160, 0.06]]) {
+        for (let x = 85; x < 172; x++) for (let y = v - 16; y <= v + 16; y++) {
+            if (Math.abs(y - v) * 2 / k[1] >= diameter / 2) continue;
+            const p = y * size + x;
+            mask[p] = 255;
+            supportPixels.get(id).push(p);
+        }
+    }
+    const input = { scene: buildSpaceScene(depth, k, size, size), candidates, supportPixels, mask,
+        minimumM: defaultMinimumBranchDiameterM };
+    const measured = evaluateBranchDiameters(input);
+    assert.deepEqual(measured.map(a => a.status), ['below_minimum', 'pass']);
+    assert.ok(Math.abs(measured[0].diameter_m - 0.04) < 0.004);
+    assert.ok(Math.abs(measured[1].diameter_m - 0.06) < 0.004);
+    const selected = selectDiameterCandidates({ ids: new Uint32Array(depth.length), results: candidates,
+        candidatePixels: supportPixels }, measured, 1);
+    assert.deepEqual(selected.selected.map(c => c.id), [2]);
+    assert.deepEqual(selected.results[0].reasons, ['diameter_below_minimum']);
+    assert.ok(supportPixels.get(1).every(p => selected.ids[p] === 0));
+    const unknown = evaluateBranchDiameters({ ...input, scene: null });
+    assert.ok(unknown.every(a => a.status === 'unknown' && a.diameter_m === null));
+    const calibratedDa2 = buildSpaceScene(flatDepth(1), k, size, size, 1, mask, depth);
+    assert.equal(calibratedDa2.geometryUnits, 'da2_calibrated_meters');
+    assert.deepEqual(evaluateBranchDiameters({ ...input, scene: calibratedDa2 }), measured);
 });
 
 test('the pose box is oriented with the added side and top clearance', () => {

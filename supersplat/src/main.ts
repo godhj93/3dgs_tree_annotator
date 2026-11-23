@@ -10,6 +10,7 @@ import { registerEditorEvents } from './editor';
 import { Events } from './events';
 import { initFileHandler } from './file-handler';
 import { registerIframeApi } from './iframe-api';
+import { landingReplayModel } from './landing-replay';
 import { registerPublishEvents } from './publish';
 import { registerRenderEvents } from './render';
 import { Scene } from './scene';
@@ -274,7 +275,12 @@ const main = async () => {
     }
 
     // handle load params
+    const showLandingReplay = url.searchParams.get('landingReplay') === '1';
     const loadList = url.searchParams.getAll('load');
+    if (showLandingReplay && !loadList.length) {
+        loadList.push(landingReplayModel);
+        scene.camera.upAxis = 'z';
+    }
     const filenameList = url.searchParams.getAll('filename');
     for (const [i, value] of loadList.entries()) {
         const decoded = decodeURIComponent(value);
@@ -286,6 +292,9 @@ const main = async () => {
             filename,
             url: decoded
         }]);
+    }
+    if (showLandingReplay) {
+        await bboxAnnotation.landingReplay.open(url.searchParams.get('frame') ?? undefined);
     }
 
 

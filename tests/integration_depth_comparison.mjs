@@ -129,7 +129,8 @@ try {
 
     const stageSettings=await evaluate(`(()=>{
         const l=scene.events.invoke('annotation.panel').liveView,landing=l.comparisonView.landing;
-        const space=landing.querySelector('fieldset');
+        const space=landing.querySelector('[aria-label="Enable bird space filter"]').closest('fieldset');
+        const diameter=landing.querySelector('[aria-label="Enable branch diameter filter"]');
         return {
             depth:!!document.querySelector('.compare-boundary [aria-label="Shared skeleton depth gap"]'),
             merge:!!l.pcaAngleNumber.closest('.compare-merged'),
@@ -140,13 +141,16 @@ try {
             topK:!!l.finalTopKInput.closest('.compare-final'),
             spaceVisible:space.getBoundingClientRect().height>0 && space.querySelector('input[type="number"]').getBoundingClientRect().height>0,
             spaceValues:Object.fromEntries([...space.querySelectorAll('input[type="number"]')].map(input=>[input.name,input.valueAsNumber])),
+            diameter:[diameter.checked,diameter.closest('fieldset').querySelector('input[type="number"]').valueAsNumber],
             optionalOn:[...l.comparisonView.root.querySelectorAll(':is(.compare-gravity,.compare-final,fieldset,details) input[type="checkbox"]')]
                 .filter(input=>input.getAttribute('aria-label')!=='Enable bird space filter').every(input=>input.checked),
             cameraAngles:[l.finalBearingSlider,l.finalEndOnSlider,l.finalImageTiltSlider].map(input=>input.valueAsNumber)
         };
     })()`);
     assert.deepEqual(stageSettings,{depth:true,merge:true,gravity:true,geometry:true,topK:true,spaceVisible:true,optionalOn:true,
-        cameraAngles:[30,90,30],spaceValues:{widthM:10,lengthM:10,heightM:10,marginM:5,approachM:1,minApproachAngleDeg:60,da2ReferenceM:null}});
+        cameraAngles:[30,90,30],spaceValues:{widthM:10,lengthM:10,heightM:10,marginM:5,approachM:1,minApproachAngleDeg:60,da2ReferenceM:null},
+        diameter:[true,5]});
+    await evaluate(`document.querySelector('[aria-label="Enable branch diameter filter"]').click()`);
 
     // A declared box side drives depth and arc length, and survives annotation export/reload.
     const beforeCalibration=await evaluate(`(()=>{const p=scene.events.invoke('annotation.panel'),s=p.liveView.last;
@@ -374,42 +378,50 @@ try {
     const finalShot=await cdp.send('Page.captureScreenshot',{format:'png'});
     await writeFile('/tmp/depth_comparison_dji_final.png',Buffer.from(finalShot.data,'base64'));
 
-    // Save every displayed figure, including scrolled-away stages, without
-    // re-inference. Pause first and hold the folder dialog to test frozen pixels.
+    // Save every displayed figure without re-inference or any folder access.
+    // Change the canvases immediately after the click to test frozen pixels.
     const figureStart=await evaluate(`(async()=>{
         const p=scene.events.invoke('annotation.panel'),l=p.liveView;
         const toggle=document.querySelector('.live-controls input[type="checkbox"]');
         toggle.checked=false;toggle.dispatchEvent(new Event('change'));
-        window._qaFigureToggle=toggle;window._qaFigureFiles=[];
+        window._qaFigureToggle=toggle;window._qaFolderCalls=0;
         window._qaFigureHash=async canvas=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',
             canvas.getContext('2d').getImageData(0,0,canvas.width,canvas.height).data))).map(x=>x.toString(16).padStart(2,'0')).join('');
         window._qaFigureExpected={};
         for(const figure of l.collectFigures()) window._qaFigureExpected[figure.name+'.png']={
             hash:await window._qaFigureHash(figure.canvas),width:figure.canvas.width,height:figure.canvas.height};
         window._qaFigureChoose=l.chooseOutputFolder;window._qaFigureWrite=l.writeFile;
-        l.chooseOutputFolder=()=>new Promise(resolve=>window._qaFigureResolve=resolve);
-        p.outputDirHandle=null;
+        window._qaFigureFolder=p.outputDirHandle;
+        const denied=async()=>{window._qaFolderCalls++;throw new DOMException('Blocked folder','SecurityError');};
+        l.chooseOutputFolder=denied;
+        p.outputDirHandle={getDirectoryHandle:denied};
+        l.writeFile=async(name,blob,folder)=>{window._qaFigureZip={name,blob,folder};};
         const before={frame:l.last.frameId,calls:window._qaDepthCalls,expected:Object.keys(window._qaFigureExpected),
             disabled:l.figuresButton.disabled,paused:!l.enabled};
-        l.figuresButton.click();return before;
+        l.figuresButton.click();
+        l.rgbCanvas.getContext('2d').fillStyle='red';l.rgbCanvas.getContext('2d').fillRect(0,0,640,640);
+        const canvas=l.comparisonView.tiles.get('3dgs:skeleton').canvas;
+        canvas.getContext('2d').clearRect(0,0,640,640);
+        return before;
     })()`);
     assert.equal(figureStart.paused,true);assert.equal(figureStart.disabled,false);
     assert.equal(figureStart.expected.length,23);
     for(const source of ['da2','3dgs']) for(const stage of ['before_space','after_space']) {
         assert.ok(figureStart.expected.includes(`${source}_${stage}.png`));
     }
-    await waitFor('window._qaFigureResolve');
-    await evaluate(`(()=>{const l=scene.events.invoke('annotation.panel').liveView;
-        l.rgbCanvas.getContext('2d').fillStyle='red';l.rgbCanvas.getContext('2d').fillRect(0,0,640,640);
-        const canvas=l.comparisonView.tiles.get('3dgs:skeleton').canvas;
-        canvas.getContext('2d').clearRect(0,0,640,640);
-        const directory=name=>({name,getDirectoryHandle:async child=>directory(name+'/'+child),
-            getFileHandle:async file=>({createWritable:async()=>({write:async blob=>window._qaFigureFiles.push({name:file,path:name+'/'+file,blob}),close:async()=>{}})})});
-        window._qaFigureResolve(directory('qa_figures'));return true;
-    })()`);
-    await waitFor('window._qaFigureFiles.length===24 && !scene.events.invoke("annotation.panel").liveView.savingFigures');
-    const figures=await evaluate(`(async()=>{const failed=[];let overview;
-        for(const file of window._qaFigureFiles){
+    await waitFor('window._qaFigureZip && !scene.events.invoke("annotation.panel").liveView.savingFigures');
+    const figures=await evaluate(`(async()=>{const failed=[],names=[];let overview;
+        const archive=window._qaFigureZip;
+        const bytes=new Uint8Array(await archive.blob.arrayBuffer());
+        const headers=new DataView(bytes.buffer), decoder=new TextDecoder();
+        let offset=0;
+        while(headers.getUint32(offset,true)===0x04034b50){
+            const size=headers.getUint32(offset+18,true);
+            const nameLength=headers.getUint16(offset+26,true);
+            const start=offset+30+nameLength+headers.getUint16(offset+28,true);
+            const name=decoder.decode(bytes.subarray(offset+30,offset+30+nameLength));
+            const file={name,blob:new Blob([bytes.subarray(start,start+size)],{type:'image/png'})};
+            names.push(name);offset=start+size;
             const image=await createImageBitmap(file.blob);
             const expected=window._qaFigureExpected[file.name];
             if(expected){const canvas=document.createElement('canvas');canvas.width=image.width;canvas.height=image.height;
@@ -419,36 +431,19 @@ try {
             image.close();
         }
         const l=scene.events.invoke('annotation.panel').liveView;
-        return {count:window._qaFigureFiles.length,failed,overview,frame:l.last.frameId,calls:window._qaDepthCalls,
-            names:window._qaFigureFiles.map(file=>file.name),allPng:window._qaFigureFiles.every(file=>file.blob.type==='image/png'),
-            paths:window._qaFigureFiles.map(file=>file.path),button:l.figuresButton.textContent};
+        return {failed,overview,frame:l.last.frameId,calls:window._qaDepthCalls,names,filename:archive.name,
+            type:archive.blob.type,folder:archive.folder,folderCalls:window._qaFolderCalls,button:l.figuresButton.textContent};
     })()`);
-    assert.deepEqual(figures.failed,[],'PNG pixels must match the displayed canvases captured before the folder dialog');
-    assert.equal(figures.allPng,true);assert.equal(figures.frame,figureStart.frame);assert.equal(figures.calls,figureStart.calls);
+    assert.deepEqual(figures.failed,[],'PNG pixels must match the displayed canvases at click time');
+    assert.equal(figures.type,'application/zip');assert.equal(figures.frame,figureStart.frame);assert.equal(figures.calls,figureStart.calls);
+    assert.equal(figures.folder,null);assert.equal(figures.folderCalls,0);
+    assert.ok(figures.filename.startsWith(figureStart.frame+'_figures_') && figures.filename.endsWith('.zip'));
     assert.equal(figures.overview.width,1352);assert.ok(figures.overview.height>6400);
-    assert.deepEqual(figures.names.slice(0,-1),figureStart.expected);
-    assert.ok(figures.paths.every(name=>name.startsWith('qa_figures/Figures/'+figureStart.frame+'_figures_')));
+    assert.deepEqual(figures.names,[...figureStart.expected,'overview.png']);
     assert.equal(figures.button,'Save Figures');
-    const overview=await evaluate(`(async()=>{const blob=window._qaFigureFiles.find(x=>x.name==='overview.png').blob;
-        const bytes=new Uint8Array(await blob.arrayBuffer());let text='';for(let i=0;i<bytes.length;i+=8192)text+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(text);})()`);
-    await writeFile('/tmp/bbox_figures_overview.png',Buffer.from(overview,'base64'));
     console.log(JSON.stringify({figures}));
-
-    // A cancelled chooser writes nothing and restores the button. Without a
-    // directory API, all the PNGs travel in a single ZIP download.
-    await evaluate(`(()=>{const l=scene.events.invoke('annotation.panel').liveView;
-        l.rgbCanvas.getContext('2d').drawImage(l.last.rgb,0,0);l.renderDepthComparison(l.last);
-        l.chooseOutputFolder=async()=>{throw new DOMException('Cancelled','AbortError')};return true;})()`);
-    assert.equal(await evaluate(`scene.events.invoke('annotation.panel').liveView.saveFigures()`),null);
-    assert.equal(await evaluate(`scene.events.invoke('annotation.panel').liveView.figuresButton.disabled`),false);
-    await evaluate(`(()=>{const l=scene.events.invoke('annotation.panel').liveView;l.chooseOutputFolder=async()=>null;
-        l.writeFile=async(name,blob)=>{window._qaFigureZip={name,blob};};return true;})()`);
-    const zipReceipt=await evaluate(`scene.events.invoke('annotation.panel').liveView.saveFigures()`);
-    assert.equal(zipReceipt.count,24);assert.match(zipReceipt.destination,/\.zip$/);
-    const archive=await evaluate(`(async()=>{const bytes=new Uint8Array(await window._qaFigureZip.blob.arrayBuffer());let text='';
-        for(let i=0;i<bytes.length;i+=8192)text+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(text);})()`);
-    await writeFile('/tmp/bbox_figures_fallback.zip',Buffer.from(archive,'base64'));
-    await evaluate(`(()=>{const l=scene.events.invoke('annotation.panel').liveView;l.chooseOutputFolder=window._qaFigureChoose;l.writeFile=window._qaFigureWrite;
+    await evaluate(`(()=>{const p=scene.events.invoke('annotation.panel'),l=p.liveView;
+        p.outputDirHandle=window._qaFigureFolder;l.chooseOutputFolder=window._qaFigureChoose;l.writeFile=window._qaFigureWrite;
         window._qaFigureToggle.checked=true;window._qaFigureToggle.dispatchEvent(new Event('change'));return true;})()`);
     await waitFor(`${ready} && scene.events.invoke('annotation.liveSnapshot').frameId!==${JSON.stringify(figureStart.frame)}`);
 

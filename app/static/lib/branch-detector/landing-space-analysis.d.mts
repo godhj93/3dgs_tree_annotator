@@ -17,13 +17,21 @@ export type SpaceAssessment = { id: number; status: 'clear' | 'blocked' | 'unkno
 export const defaultBirdSpace: Readonly<BirdSpaceSettings>;
 export const cornerProbeRadiusM: number;
 export const cornerMinHitPixels: number;
+export const defaultMinimumBranchDiameterM: number;
+export type BranchDiameterAssessment = { id: number; status: 'pass' | 'below_minimum' | 'unknown';
+    diameter_m: number | null; profiles: number };
 export function birdBoxBounds(settings: BirdSpaceSettings): { low: number[]; high: number[] };
 export function validateBirdSpace(settings: Partial<BirdSpaceSettings>): BirdSpaceSettings;
 export type SpaceScene = { depth: Float32Array; intrinsics: number[]; width: number; height: number;
     points: Float32Array; pixels: Uint32Array; geometryUnits: SpaceAssessment['geometry_units']; calibration: Da2SpaceCalibration | null };
+export function assessLandingCorners(scene: SpaceScene, topCorners: number[][],
+    targetPixels: ReadonlySet<number>): NonNullable<SpaceAssessment['top_corners']>;
 export function buildSpaceScene(depth: Float32Array, intrinsics: number[], width?: number, height?: number,
     da2ReferenceM?: number | null, referenceMask?: Uint8Array | null, metricDepth?: Float32Array | null): SpaceScene;
 export function evaluateLandingSpace(input: { scene: SpaceScene | null; candidates: { id: number }[];
     supportPixels: Map<number, number[]>; up: number[]; settings: BirdSpaceSettings }): SpaceAssessment[];
+export function evaluateBranchDiameters(input: { scene: SpaceScene | null; candidates: { id: number; center_px: number[] }[];
+    supportPixels: Map<number, number[]>; mask: Uint8Array | null; minimumM: number }): BranchDiameterAssessment[];
+export function selectDiameterCandidates<T>(base: T, assessments: BranchDiameterAssessment[], topK: number | null): T;
 export function selectSpaceCandidates<T>(base: T, assessments: SpaceAssessment[], topK: number | null): T;
 export function projectedHeight(a: number[], b: number[], up: number[]): number;

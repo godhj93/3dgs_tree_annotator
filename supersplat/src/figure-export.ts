@@ -61,14 +61,14 @@ export const figureOverview = (figures: Figure[], title: string, description: st
     return canvas;
 };
 
-const png = (canvas: HTMLCanvasElement) => new Promise<Blob>((resolve, reject) => {
+export const encodeFigurePng = (canvas: HTMLCanvasElement) => new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(blob => (blob ? resolve(blob) : reject(new Error('Figure PNG encoding failed'))), 'image/png');
 });
 
 export const encodeFigures = async (figures: Figure[], title: string, description: string): Promise<PngFile[]> => {
     const files: PngFile[] = [];
-    for (const figure of figures) files.push({ name: `${figure.name}.png`, blob: await png(figure.canvas) });
-    files.push({ name: 'overview.png', blob: await png(figureOverview(figures, title, description)) });
+    for (const figure of figures) files.push({ name: `${figure.name}.png`, blob: await encodeFigurePng(figure.canvas) });
+    files.push({ name: 'overview.png', blob: await encodeFigurePng(figureOverview(figures, title, description)) });
     return files;
 };
 

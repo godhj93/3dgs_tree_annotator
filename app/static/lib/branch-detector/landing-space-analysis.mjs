@@ -21,6 +21,7 @@ const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const valid = z => Number.isFinite(z) && z > 0;
 export const cornerProbeRadiusM = 0.02;
 export const cornerMinHitPixels = 3;
+export const defaultMinimumBranchDiameterM = 0.05;
 
 export const validateBirdSpace = (settings) => {
     const s = { ...defaultBirdSpace, ...settings };
@@ -143,6 +144,92 @@ const fitAxis = (points, center) => {
     return { axis, linearity: trace > 1e-9 ? clamp((3 * eigen / trace - 1) / 2, 0, 1) : 0 };
 };
 
+// Probe the visible silhouette in a metric plane transverse to the branch
+// and viewing ray. The mask supplies the boundary; this source's depth
+// supplies scale and prevents joining surfaces across a depth discontinuity.
+const diameterProfile = (scene, mask, support, anchor, axis) => {
+    const [fx, fy, cx, cy] = scene.intrinsics;
+    const project = p => [cx + fx * p[0] / -p[2], cy - fy * p[1] / -p[2]];
+    const point = Array.from(scene.points.subarray(anchor * 3, anchor * 3 + 3));
+    const transverse = cross(point, axis);
+    if (norm(transverse) < 0.2 * norm(point)) return null;
+    const stepM = 0.0025;
+    const normalStep = mul(unit(transverse), stepM);
+    const maxSteps = Math.ceil(0.30 / stepM);
+    const surfaceGate = Math.min(0.1, 0.035 - point[2] * 0.018);
+    const supportGate = Math.min(0.22, 0.08 - point[2] * 0.045);
+    const side = direction => {
+        for (let n = 1; n <= maxSteps; n++) {
+            const at = add(point, mul(normalStep, n * direction));
+            if (at[2] >= -0.1) return { n, censored: true };
+            const [x, y] = project(at).map(Math.round);
+            if (x < 0 || x >= scene.width || y < 0 || y >= scene.height) return { n, censored: true };
+            const p = y * scene.width + x;
+            if (!mask[p]) return { n, censored: false };
+            // Within the same segmented link, allow the surface to curve away
+            // from the anchor. Outside it require a much tighter depth match.
+            const maxGap = support.has(p) ? supportGate : surfaceGate;
+            if (!valid(scene.depth[p]) || Math.abs(scene.depth[p] + at[2]) > maxGap) return { n, censored: true };
+        }
+        return { n: maxSteps + 1, censored: true };
+    };
+    const negative = side(-1), positive = side(1);
+    return { widthM: (negative.n + positive.n - 1) * stepM, censored: negative.censored || positive.censored };
+};
+
+export const evaluateBranchDiameters = ({ scene, candidates, supportPixels, mask, minimumM }) => {
+    if (!Number.isFinite(minimumM) || minimumM < 0.005 || minimumM > 0.5) throw new Error('Invalid branch diameter threshold');
+    return candidates.map(candidate => {
+        const unknown = { id: candidate.id, status: 'unknown', diameter_m: null, profiles: 0 };
+        if (!scene || mask?.length !== scene.depth.length || !candidate.center_px?.every(Number.isFinite)) return unknown;
+        const pixels = (supportPixels.get(candidate.id) ?? []).filter(p => mask[p] && valid(scene.depth[p]));
+        if (pixels.length < 6) return unknown;
+        const [u, v] = candidate.center_px;
+        const distancePx = p => (p % scene.width - u) ** 2 + (Math.floor(p / scene.width) - v) ** 2;
+        const centerPixel = pixels.reduce((best, p) => distancePx(p) < distancePx(best) ? p : best);
+        const [fx, fy] = scene.intrinsics, z = scene.depth[centerPixel];
+        const x0 = centerPixel % scene.width, y0 = Math.floor(centerPixel / scene.width);
+        // Fit to observed pixels in the calibrated image plane. Choosing the
+        // sections on the mask also works when a short, curved fragment would
+        // fail to line up with extrapolated points along a straight 3D axis.
+        const samples = pixels.map(p => ({ p, pos: [(p % scene.width - x0) * z / fx,
+            (y0 - Math.floor(p / scene.width)) * z / fy, 0] }))
+            .filter(({ p, pos }) => norm(pos) <= 0.18 &&
+                Math.abs(scene.depth[p] - z) <= Math.min(0.22, 0.08 + z * 0.04));
+        if (samples.length < 6) return unknown;
+        const mean = [0, 1, 2].map(i => samples.reduce((sum, { pos }) => sum + pos[i], 0) / samples.length);
+        const fit = fitAxis(samples.map(s => s.pos), mean);
+        if (!fit || fit.linearity < 0.35) return unknown;
+        const bins = new Map();
+        for (const { p, pos } of samples) {
+            const centered = sub(pos, mean);
+            const along = dot(centered, fit.axis);
+            const bin = Math.round(along / 0.02);
+            if (Math.abs(bin) > 3) continue;
+            const error = norm(sub(centered, mul(fit.axis, along))) +
+                Math.abs(along - bin * 0.02) * 0.5;
+            if (!bins.has(bin) || error < bins.get(bin).error) bins.set(bin, { p, error });
+        }
+        const support = new Set(pixels);
+        const profiles = [...bins].flatMap(([bin, { p }]) => {
+            const observed = diameterProfile(scene, mask, support, p, fit.axis);
+            return observed === null ? [] : [{ bin, ...observed }];
+        });
+        if (profiles.length < 3 || !profiles.some(p => p.bin < 0) || !profiles.some(p => p.bin > 0)) {
+            return { ...unknown, profiles: profiles.length };
+        }
+        const middle = values => {
+            values.sort((a, b) => a - b);
+            return (values[Math.floor(values.length / 2)] + values[Math.floor((values.length - 1) / 2)]) / 2;
+        };
+        const lower = middle(profiles.map(p => p.widthM));
+        const upper = middle(profiles.map(p => p.censored ? Infinity : p.widthM));
+        const status = lower + 1e-8 >= minimumM ? 'pass' : upper + 1e-8 < minimumM ? 'below_minimum' : 'unknown';
+        return { id: candidate.id, status, diameter_m: status === 'unknown' ? null : status === 'below_minimum' ? upper : lower,
+            profiles: profiles.length };
+    });
+};
+
 export const birdBoxBounds = s => ({
     low: [-s.lengthM / 2 - s.marginM, -s.widthM / 2 - s.marginM, 0],
     high: [s.lengthM / 2 + s.marginM, s.widthM / 2 + s.marginM, s.heightM + s.marginM]
@@ -246,6 +333,9 @@ const supportedHit = (hits, scene) => {
     return null;
 };
 
+export const assessLandingCorners = (scene, topCorners, targetPixels) =>
+    topCorners.map((corner, index) => inspectCorner(corner, index + 4, scene, targetPixels));
+
 export const assessSpaceBox = ({ scene, contact, up, axis, axisReliable = true, targetPixels = new Set(), settings }) => {
     const s = validateBirdSpace(settings), geometry = birdBoxGeometry(contact, up, s);
     const result = { status: 'unknown',
@@ -260,7 +350,7 @@ export const assessSpaceBox = ({ scene, contact, up, axis, axisReliable = true, 
     if (!scene || !geometry) {
         result.reasons.push('metric_geometry_missing'); return result;
     }
-    result.top_corners = geometry.corners_camera_m.slice(4).map((corner, index) => inspectCorner(corner, index + 4, scene, targetPixels));
+    result.top_corners = assessLandingCorners(scene, geometry.corners_camera_m.slice(4), targetPixels);
     result.observed_fraction = result.top_corners.filter(corner => corner.status !== 'unknown').length / 4;
     if (result.top_corners.some(corner => corner.status === 'blocked')) result.reasons.push('perch_space_blocked');
     if (result.top_corners.some(corner => corner.status === 'unknown')) result.reasons.push('space_unobserved');
@@ -366,17 +456,33 @@ export const evaluateLandingSpace = ({ scene, candidates, supportPixels, up, set
     return { id: candidate.id, ...result, axis_camera: fit?.axis, axis_linearity: fit?.linearity };
 });
 
+const selectMetricCandidates = (base, results, topK) => {
+    const eligible = results.filter(c => !c.reasons.length).sort((a, b) => Number(a.space?.status !== 'clear') - Number(b.space?.status !== 'clear') || b.score - a.score || a.id - b.id);
+    const selected = topK == null ? eligible : eligible.slice(0, clamp(Math.round(topK), 1, 253));
+    const ids = new Uint32Array(base.ids.length);
+    for (const c of selected) for (const p of base.candidatePixels.get(c.id) ?? []) ids[p] = c.id;
+    return { ...base, results, eligible, selected, ids };
+};
+
+export const selectDiameterCandidates = (base, assessments, topK) => {
+    const byId = new Map(assessments.map(a => [a.id, a]));
+    const results = base.results.map(c => {
+        const diameter = byId.get(c.id);
+        if (!diameter) return c;
+        const reason = diameter.status === 'below_minimum' ? 'diameter_below_minimum' :
+            diameter.status === 'unknown' ? 'diameter_unobserved' : null;
+        return { ...c, diameter, reasons: reason ? [...c.reasons, reason] : c.reasons };
+    });
+    return selectMetricCandidates(base, results, topK);
+};
+
 export const selectSpaceCandidates = (base, assessments, topK) => {
     const byId = new Map(assessments.map(a => [a.id, a]));
     const results = base.results.map((c) => {
         const space = byId.get(c.id);
         return { ...c, space, reasons: [...c.reasons, ...(space?.status === 'blocked' ? space.reasons : [])] };
     });
-    const eligible = results.filter(c => !c.reasons.length).sort((a, b) => Number(a.space?.status !== 'clear') - Number(b.space?.status !== 'clear') || b.score - a.score || a.id - b.id);
-    const selected = topK == null ? eligible : eligible.slice(0, clamp(Math.round(topK), 1, 253));
-    const ids = new Uint32Array(base.ids.length);
-    for (const c of selected) for (const p of base.candidatePixels.get(c.id) ?? []) ids[p] = c.id;
-    return { ...base, results, eligible, selected, ids };
+    return selectMetricCandidates(base, results, topK);
 };
 
 export const projectedHeight = (a, b, up) => Math.abs(dot(sub(b, a), unit(up) ?? [0, 0, 0]));

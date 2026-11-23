@@ -200,6 +200,81 @@ body {
     image-rendering: pixelated;
 }
 
+.landing-replay-active {
+    #canvas-container { position: relative; }
+    #canvas-container > :not(#canvas):not(#landing-replay-overlay) { visibility: hidden; }
+    &.bbox-manager-camera-split #sensor-frame {
+        width: 100vw;
+        align-self: stretch;
+    }
+    .bbox-annotation,
+    .bbox-manager,
+    #status-bar { display: none; }
+}
+
+#landing-replay-overlay {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 2;
+    pointer-events: none;
+}
+
+.landing-replay {
+    position: fixed;
+    z-index: 45;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(440px, calc(100vw - 44px));
+    box-sizing: border-box;
+    padding: 11px 13px;
+    color: #edf5f0;
+    background: rgba(13, 21, 18, .95);
+    border: 1px solid #3f5248;
+    border-radius: 8px;
+    box-shadow: 0 5px 24px rgba(0, 0, 0, .28);
+    font: 13px system-ui, sans-serif;
+
+    .landing-replay-heading,
+    .landing-replay-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .landing-replay-heading {
+        justify-content: space-between;
+        margin-bottom: 7px;
+        strong { font-size: 14px; }
+    }
+
+    select, input, button {
+        box-sizing: border-box;
+        min-height: 27px;
+        padding: 3px 6px;
+        color: inherit;
+        background-color: #1d2c24;
+        border: 1px solid #4b6253;
+        border-radius: 4px;
+    }
+
+    input { width: 56px; }
+    button:not(:disabled) { cursor: pointer; }
+    button:disabled, input:disabled, select:disabled { opacity: .55; }
+    button[data-action='save-landing-figures'] {
+        margin-left: auto;
+        color: #b9f8cf;
+        border-color: #51976a;
+    }
+    :focus-visible { outline: 2px solid #55f28e; outline-offset: 2px; }
+    .landing-replay-status { margin-top: 8px; color: #adf6c8; }
+    a { display: inline-block; margin-top: 8px; color: #adf6c8; }
+    a[hidden] { display: none; }
+}
+
 #tooltips-container {
     position: fixed;
     left: 0;

@@ -2,6 +2,7 @@ import { Color, Mat4, Ray, Vec3 } from 'playcanvas';
 
 import { ElementType } from './element';
 import { Events } from './events';
+import { LandingReplay } from './landing-replay';
 import { LiveView } from './live-view';
 import { parseBoxScaleReference, parseHeightScaleReference } from './live-view-utils';
 import type { BoxScaleReference, HeightScaleReference } from './live-view-utils';
@@ -357,6 +358,8 @@ class BBoxAnnotation {
     };
     boxes: Box[] = [];
 
+    readonly landingReplay: LandingReplay;
+
     constructor(events: Events, scene: Scene) {
         this.events = events;
         this.scene = scene;
@@ -382,6 +385,7 @@ class BBoxAnnotation {
             };
         }, () => this.outputDirHandle, () => this.chooseOutputFolder(),
         (name, blob, folder) => this.writeBlobFile(name, blob, folder));
+        this.landingReplay = new LandingReplay(scene, this.canvasContainer, this.liveView);
         events.function('annotation.batchCaptureRunning', () => this.spiralRunning);
         this.handleSvg = this.createHandleOverlay();
         if (this.canvasContainer && this.handleSvg) {
@@ -1222,8 +1226,8 @@ class BBoxAnnotation {
             });
         });
         saveFigures.dataset.action = 'save-figures';
-        saveFigures.setAttribute('aria-label', 'Save all BBox Manager figures as PNG');
-        saveFigures.title = 'Save current RGB, mask, depths and all comparison figures as PNG';
+        saveFigures.setAttribute('aria-label', 'Download all BBox Manager figures as a ZIP of PNG files');
+        saveFigures.title = 'Download current RGB, mask, depths and all comparison figures in one ZIP';
         saveFigures.disabled = true;
         const maximize = document.createElement('button');
         maximize.textContent = 'maximize';
@@ -1252,7 +1256,9 @@ class BBoxAnnotation {
             root.classList.toggle('collapsed');
             toggle.textContent = root.classList.contains('collapsed') ? 'show' : 'hide';
         });
-        head.append(title, saveFigures, maximize, toggle);
+        const replay = this.button('착륙 결과', () => void this.landingReplay.open());
+        replay.dataset.action = 'landing-replay';
+        head.append(title, replay, saveFigures, maximize, toggle);
 
         const body = document.createElement('div');
         body.className = 'bbox-preview-body';

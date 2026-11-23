@@ -10,6 +10,7 @@ export type ComparisonSourceView = {
 
 type StageControls = Partial<Record<ComparisonStage, HTMLElement[]>> & {
     geometry: HTMLElement;
+    diameter: HTMLElement;
     space: HTMLElement;
 };
 
@@ -98,7 +99,7 @@ export class DepthComparisonView {
         this.landing.className = 'live-tile live-junction-tile';
         const landingTitle = document.createElement('h3'); landingTitle.className = 'live-tile-title live-space-title';
         landingTitle.textContent = 'Finding landing branches';
-        this.landing.append(landingTitle, stageControls.geometry, stageControls.space);
+        this.landing.append(landingTitle, stageControls.geometry, stageControls.diameter, stageControls.space);
         for (const key of ['da2', '3dgs'] as const) {
             const heading = document.createElement('div'); heading.className = 'live-tile-title'; heading.textContent = sourceNames[key];
             const grid = document.createElement('div'); grid.className = 'live-junction-grid';

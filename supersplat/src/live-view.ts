@@ -13,8 +13,9 @@ import { Splat } from './splat';
 import { State } from './splat-state';
 import { resolveGravityWorld, segmentFinalLanding } from './final-landing-analysis.mjs';
 import type { GravitySample, FinalLandingResult } from './final-landing-analysis.mjs';
-import { birdBoxBounds, buildSpaceScene, cornerMinHitPixels, cornerProbeRadiusM, defaultBirdSpace, evaluateLandingSpace, selectSpaceCandidates } from '../static/lib/branch-detector/landing-space-analysis.mjs';
-import type { Da2SpaceCalibration, SpaceAssessment } from '../static/lib/branch-detector/landing-space-analysis.mjs';
+import { birdBoxBounds, buildSpaceScene, cornerMinHitPixels, cornerProbeRadiusM, defaultBirdSpace, defaultMinimumBranchDiameterM,
+    evaluateBranchDiameters, evaluateLandingSpace, selectDiameterCandidates, selectSpaceCandidates } from '../static/lib/branch-detector/landing-space-analysis.mjs';
+import type { BranchDiameterAssessment, Da2SpaceCalibration, SpaceAssessment } from '../static/lib/branch-detector/landing-space-analysis.mjs';
 import { LandingSpaceClient } from './landing-space-client';
 import { describeSpace, drawSpaceBox, projectSpacePoint, summarizeSpaceRejections } from './landing-space-view';
 
@@ -78,6 +79,7 @@ type LiveSnapshot = {
     finalLandingOverlay?: HTMLCanvasElement;
     finalLandingCpuMs?: number;
     finalBase?: FinalLandingResult;
+    diameterBase?: FinalLandingResult;
     spaceKey?: string;
     spacePending?: boolean;
     spaceCpuMs?: number;
@@ -288,6 +290,7 @@ const principalAxisFromMoments = (pixels: number, sum: number[], outer: number[]
 
 class LiveView {
     enabled = true;
+    private previewInput: HTMLInputElement;
     capturing = false;
     busy = false;
     saving = false;
@@ -395,6 +398,8 @@ class LiveView {
     finalStrictCameraAngles = true;
     limitFinalTopK = true;
     finalTopK = 3;
+    filterBranchDiameter = true;
+    minimumBranchDiameterM = defaultMinimumBranchDiameterM;
     birdSpace = { ...defaultBirdSpace };
     da2SpaceReferenceM: number | null = null;
     spaceClient = new LandingSpaceClient();
@@ -569,16 +574,11 @@ class LiveView {
         const controls = document.createElement('div');
         controls.className = 'live-controls';
         const enabledLabel = document.createElement('label');
-        const input = document.createElement('input');
-        input.type = 'checkbox';
-        input.checked = true;
-        input.addEventListener('change', () => {
-            this.enabled = input.checked;
-            this.applyProfile();
-            this.refresh();
-            if (!this.enabled) this.message('paused', 'Preview paused. Camera controls restored.');
-        });
-        enabledLabel.append(input, 'Live preview');
+        this.previewInput = document.createElement('input');
+        this.previewInput.type = 'checkbox';
+        this.previewInput.checked = this.enabled;
+        this.previewInput.addEventListener('change', () => this.setEnabled(this.previewInput.checked));
+        enabledLabel.append(this.previewInput, 'Live preview');
         const maskLabel = document.createElement('label');
         this.binaryInput = document.createElement('input');
         this.binaryInput.type = 'checkbox';
@@ -952,6 +952,32 @@ class LiveView {
         });
         strictCameraLabel.append(this.finalStrictCameraCheckbox, '카메라 시점 각도 검사');
         cameraControls.append(strictCameraLabel);
+        const diameterControls = document.createElement('fieldset');
+        diameterControls.className = 'live-stage-settings';
+        const diameterTitle = document.createElement('legend');
+        diameterTitle.textContent = '가지 지름 필터 · 공간 검사 전';
+        const diameterInput = document.createElement('input');
+        diameterInput.type = 'number'; diameterInput.name = 'minimumBranchDiameterCm';
+        diameterInput.min = '0.5'; diameterInput.max = '50'; diameterInput.step = '0.5';
+        diameterInput.value = String(this.minimumBranchDiameterM * 100);
+        diameterInput.setAttribute('aria-label', '최소 가지 지름 (cm)');
+        diameterInput.addEventListener('change', () => {
+            const cm = diameterInput.valueAsNumber;
+            if (!Number.isFinite(cm) || cm < 0.5 || cm > 50) {
+                diameterInput.value = String(this.minimumBranchDiameterM * 100);
+                return;
+            }
+            this.minimumBranchDiameterM = cm / 100;
+            this.queueComparisonRender();
+        });
+        const diameterField = document.createElement('label');
+        diameterField.className = 'live-pca-controls';
+        diameterField.append('최소 가지 지름 (cm)', diameterInput);
+        diameterControls.append(diameterTitle, this.filterCheckbox('가지 지름 검사 적용',
+            'Enable branch diameter filter', this.filterBranchDiameter, checked => {
+                this.filterBranchDiameter = checked;
+                diameterInput.disabled = !checked;
+            }), diameterField);
         const spaceControls = document.createElement('fieldset'); spaceControls.className = 'live-stage-settings';
         const spaceTitle = document.createElement('legend'); spaceTitle.textContent = '물리적 공간 필터 · 위쪽 꼭짓점';
         spaceControls.append(spaceTitle);
@@ -1211,6 +1237,7 @@ class LiveView {
             merged: [pcaControls],
             gravity: [gravityControls, gravityLengthControls, gsLengthControls, gravityOptions],
             geometry: geometryControls,
+            diameter: diameterControls,
             space: spaceControls,
             final: [finalLimit, finalTopKLabel]
         }, value => {
@@ -1220,6 +1247,14 @@ class LiveView {
         }, () => this.queueComparisonRender());
         this.manager.querySelector('.bbox-preview-body').prepend(root);
         this.message('waiting', 'Move the camera or edit a box; preview updates after 400ms of stability.');
+    }
+
+    setEnabled(enabled: boolean) {
+        this.enabled = enabled;
+        this.previewInput.checked = enabled;
+        this.applyProfile();
+        this.refresh();
+        if (!enabled) this.message('paused', 'Preview paused. Camera controls restored.');
     }
 
     layoutCamera() {
@@ -1671,6 +1706,7 @@ class LiveView {
         const up = [0, 1, 2].map(column => -pose.gravity.vector.reduce((sum: number, value: number, row: number) =>
             sum + value * pose.camera_to_world[row][column], 0));
         const box = { ...this.birdSpace, enabled: !frame.skipSpace };
+        const minimumDiameter = box.enabled && this.filterBranchDiameter ? this.minimumBranchDiameterM : null;
         const da2Scene = box.enabled ? buildSpaceScene(da2Depth, intrinsics, 640, 640, 1, null, calibrationDepth) : null;
         if (box.enabled && da2Scene?.geometryUnits !== 'da2_calibrated_meters') {
             throw new Error(`${frameId}: DA2 metric calibration unavailable`);
@@ -1701,11 +1737,18 @@ class LiveView {
                 return { stages, ids: landingCandidateIds(base, base.eligible),
                     counts: { before: base.eligible.length, clear: null, blocked: 0, unknown: 0 } };
             }
-            const assessments = evaluateLandingSpace({ scene: da2Scene, candidates: base.eligible, supportPixels: base.supportPixels, up, settings: box });
-            const result = selectSpaceCandidates(base, assessments, null);
+            let beforeSpace = base;
+            if (minimumDiameter !== null) {
+                const rgba = mask.getContext('2d').getImageData(0, 0, 640, 640).data;
+                const maskBytes = Uint8Array.from(da2Scene.depth, (_, p) => rgba[p * 4]);
+                beforeSpace = selectDiameterCandidates(base, evaluateBranchDiameters({ scene: da2Scene, candidates: base.eligible,
+                    supportPixels: base.supportPixels, mask: maskBytes, minimumM: minimumDiameter }), null);
+            }
+            const assessments = evaluateLandingSpace({ scene: da2Scene, candidates: beforeSpace.eligible, supportPixels: base.supportPixels, up, settings: box });
+            const result = selectSpaceCandidates(beforeSpace, assessments, null);
             const clear = result.eligible.filter(candidate => candidate.space?.status === 'clear');
             const ids = landingCandidateIds(result, clear);
-            return { stages, ids, counts: { before: base.eligible.length, clear: clear.length,
+            return { stages, ids, counts: { before: beforeSpace.eligible.length, clear: clear.length,
                 blocked: assessments.filter(item => item.status === 'blocked').length,
                 unknown: assessments.filter(item => item.status === 'unknown').length } };
         };
@@ -1713,6 +1756,7 @@ class LiveView {
         return { da2, reference, calibration: da2Scene?.calibration ?? null,
             filters: { depthGapThreshold: this.depthGapThreshold, mergeMaxAngle: this.pcaMaxAngle,
                 requireGravityComponents: this.requireGravityComponents, birdSpace: box,
+                minimumBranchDiameterCm: minimumDiameter === null ? null : minimumDiameter * 100,
                 da2: this.finalSettings('relative_inverse', null) } };
     }
 
@@ -1787,7 +1831,8 @@ class LiveView {
                 continue;
             }
             this.computeSourceFilters(analysis);
-            const detection = analysis.detection, final = analysis.finalLanding, beforeSpace = analysis.finalBase;
+            const detection = analysis.detection, final = analysis.finalLanding;
+            const beforeSpace = analysis.diameterBase ?? analysis.finalBase;
             const display = this.visibleLanding(analysis);
             displayedIds[source] = display.result.ids;
             analysis.linkOverlay ??= this.linkOverlay(analysis, analysis.linkLabels);
@@ -1824,6 +1869,12 @@ class LiveView {
             const unknown = final.eligible.length - clear;
             const blocked = beforeSpace.eligible.length - final.eligible.length;
             const spaceRejections = blocked ? summarizeSpaceRejections(final.results.map(candidate => candidate.space)) : '';
+            const diameters = beforeSpace.results.map(candidate => candidate.diameter).filter(Boolean);
+            const diameterCaption = this.filterBranchDiameter ?
+                analysis.spacePending ? '가지 지름 검사 중…' :
+                    `지름 ≥ ${this.minimumBranchDiameterM * 100} cm · 통과 ${beforeSpace.eligible.length} · ` +
+                    `미달 ${diameters.filter(d => d.status === 'below_minimum').length} · 미확인 ${diameters.filter(d => d.status === 'unknown').length}` :
+                `후보 ${beforeSpace.eligible.length}개`;
             let afterSpaceCaption = `통과 ${clear} · 미확인 ${unknown} · 탈락 ${blocked}`;
             if (analysis.spacePending) {
                 afterSpaceCaption = '공간 검사 중…';
@@ -1848,7 +1899,7 @@ class LiveView {
                 ` · BBox ${reference.box_id} ${reference.axis} ${(reference.actual_length_m * 100).toFixed(1)} cm` : ` · ${sceneCalibration}` :
                 da2Calibration?.method === 'assumed_median' ? ` · 깊이 중앙값 ${da2Calibration.median_reference_m} m 가정` :
                     da2Calibration ? ` · ${sceneCalibration}으로 거리 보정` :
-                        this.birdSpace.enabled && !analysis.spacePending ? ' · 거리 보정 데이터 부족' : '';
+                        (this.birdSpace.enabled || this.filterBranchDiameter) && !analysis.spacePending ? ' · 거리 보정 데이터 부족' : '';
             const selectedLengths = display.result.selected.map(candidate => metric ?
                 `ID ${candidate.id}: ~${candidate.centerline_length_cm?.toFixed(1) ?? '?'} cm` :
                 `ID ${candidate.id}: ${candidate.centerline_length_px.toFixed(0)} px`).join(' · ');
@@ -1860,7 +1911,7 @@ class LiveView {
                     pca: `${detection.pcaObjects.filter(object => object.reliable).length} reliable 3D axes`,
                     merged: `${analysis.pcaMergedCount} merged regions`,
                     gravity: `${new Set(analysis.gravityFilteredLabels).size - (analysis.gravityFilteredLabels.includes(0) ? 1 : 0)} retained regions${this.filterGravityLength ? ` · min length ${metric ? `${this.minSkeletonLengthCm} cm` : `${this.minGravityLength} px`}` : ''}`,
-                    before_space: `후보 ${beforeSpace.eligible.length}개`,
+                    before_space: diameterCaption,
                     after_space: afterSpaceCaption,
                     final: `${display.result.selected.length} shown / ${display.result.eligible.length} eligible · ${selectedLengths} · ${analysis.spacePending ? '공간 검사 중…' : describeSpace(inspected?.space)} · rejected: ${[...reasons].map(([key, count]) => `${key} ${count}`).join(', ') || 'none'}`
                 },
@@ -1871,7 +1922,10 @@ class LiveView {
                     const object = detection.pcaObjects.find(item => item.id === id);
                     const length = metric ? `~${object?.centerlineLengthCm?.toFixed(1) ?? '?'} cm` : `${object?.centerlineLengthPx ?? 0} px`;
                     if (candidate && this.spaceInspectIds[source] !== id) { this.spaceInspectIds[source] = id; this.queueComparisonRender(); }
-                    return candidate ? `ID ${id} · skeleton ${length} · ${candidate.reasons.length ? candidate.reasons.join(', ') : 'eligible'} · angle ${candidate.angle_from_horizontal_deg.toFixed(1)}° · line ${candidate.linearity.toFixed(2)} · width ${candidate.apparent_width_px.toFixed(1)}px · ${describeSpace(candidate.space)}` :
+                    const diameter = candidate?.diameter;
+                    const diameterLabel = diameter ?
+                        diameter.diameter_m == null ? ' · 지름 미확인' : ` · 추정 지름 ${(diameter.diameter_m * 100).toFixed(1)} cm` : '';
+                    return candidate ? `ID ${id} · skeleton ${length}${diameterLabel} · ${candidate.reasons.length ? candidate.reasons.join(', ') : 'eligible'} · angle ${candidate.angle_from_horizontal_deg.toFixed(1)}° · line ${candidate.linearity.toFixed(2)} · width ${candidate.apparent_width_px.toFixed(1)}px · ${describeSpace(candidate.space)}` :
                         object ? `ID ${id} · skeleton ${length} · filtered before final stage` : 'No valid branch at this pixel';
                 } };
         }
@@ -1907,7 +1961,8 @@ class LiveView {
                 'pcaMergedLabels', 'pcaMergedCount', 'pcaMergedObjects', 'pcaMergedAngle', 'pcaMergedOverlay',
                 'gravityMergedLabels', 'gravityMergedObjects', 'gravityMergedOverlay', 'gravityMergedKey',
                 'gravityEligibleCount', 'gravityComponentEligibleIds', 'gravityFilteredLabels', 'gravityFilteredOverlay',
-                'gravityFilterKey', 'finalLanding', 'finalLandingKey', 'finalLandingOverlay', 'finalLandingCpuMs', 'finalBase', 'spaceKey', 'spacePending', 'spaceCpuMs', 'spaceCalibration'] as const;
+                'gravityFilterKey', 'finalLanding', 'finalLandingKey', 'finalLandingOverlay', 'finalLandingCpuMs', 'finalBase',
+                'diameterBase', 'spaceKey', 'spacePending', 'spaceCpuMs', 'spaceCalibration'] as const;
             for (const field of fields) (root as any)[field] = da[field];
             root.analysisMask = da.mask; root.depthKind = 'relative_inverse';
         }
@@ -2448,7 +2503,7 @@ class LiveView {
     }
 
     spaceReady(root = this.last) {
-        return !this.birdSpace.enabled || !!root && Object.values(root.analyses ?? {}).every(a =>
+        return (!this.birdSpace.enabled && !this.filterBranchDiameter) || !!root && Object.values(root.analyses ?? {}).every(a =>
             a.analysisStatus !== 'ready' || !!a.spaceKey && !a.spacePending);
     }
 
@@ -2456,9 +2511,12 @@ class LiveView {
         if (!snapshot.depthSource && this.last?.analyses?.da2) return;
         const base = snapshot.finalBase ?? snapshot.finalLanding;
         if (!base) return;
-        if (!this.birdSpace.enabled) {
+        const checkSpace = this.birdSpace.enabled;
+        const minimumDiameter = this.filterBranchDiameter ? this.minimumBranchDiameterM : null;
+        if (!checkSpace && minimumDiameter === null) {
             snapshot.spaceKey = 'disabled'; snapshot.spacePending = false;
             snapshot.spaceCalibration = null;
+            snapshot.diameterBase = base;
             snapshot.finalLanding = base; snapshot.finalLandingOverlay = finalLandingCanvas(base.ids);
             return;
         }
@@ -2468,15 +2526,17 @@ class LiveView {
         const da2ReferenceM = source === 'da2' ? manualDA2 ?? 1 : undefined;
         const metricReference = autoDA2 ? snapshot.gsDepth ?? undefined : undefined;
         const depthKey = source === 'da2' ? manualDA2 ?? 'metric' : snapshot.pose.meters_per_scene_unit;
-        const key = `${snapshot.frameId}:${snapshot.finalLandingKey}:${JSON.stringify(this.birdSpace)}:${JSON.stringify(snapshot.pose.gravity)}:${depthKey}`;
+        const key = `${snapshot.frameId}:${snapshot.finalLandingKey}:${JSON.stringify(this.birdSpace)}:${minimumDiameter}:${JSON.stringify(snapshot.pose.gravity)}:${depthKey}`;
         if (snapshot.spaceKey === key) return;
         snapshot.spaceKey = key;
         snapshot.spaceCalibration = null;
         const topK = this.limitFinalTopK ? this.finalTopK : null;
-        const unknown = (reason: string): SpaceAssessment[] => base.eligible.map((c): SpaceAssessment => ({ id: c.id,
+        const unknownSpace = (reason: string): SpaceAssessment[] => checkSpace ? base.eligible.map((c): SpaceAssessment => ({ id: c.id,
             status: 'unknown', reasons: [reason], approach_angle_deg: null, contact_camera_m: null,
-            min_clearance_m: null, observed_fraction: 0, geometry: null }));
-        const apply = (assessments: SpaceAssessment[]) => {
+            min_clearance_m: null, observed_fraction: 0, geometry: null })) : [];
+        const unknownDiameters = (): BranchDiameterAssessment[] => minimumDiameter === null ? [] :
+            base.eligible.map((c): BranchDiameterAssessment => ({ id: c.id, status: 'unknown', diameter_m: null, profiles: 0 }));
+        const apply = (assessments: SpaceAssessment[], diameters: BranchDiameterAssessment[]) => {
             const pose = snapshot.pose;
             for (const a of assessments) if (source === '3dgs' && a.contact_camera_m) {
                 a.contact_world_m = [0, 1, 2].map(row =>
@@ -2484,10 +2544,11 @@ class LiveView {
                         sum + value * a.contact_camera_m[col], 0) +
                     pose.camera_to_world[row][3] * pose.meters_per_scene_unit);
             }
-            snapshot.finalLanding = selectSpaceCandidates(base, assessments, topK);
+            snapshot.diameterBase = minimumDiameter === null ? base : selectDiameterCandidates(base, diameters, topK);
+            snapshot.finalLanding = checkSpace ? selectSpaceCandidates(snapshot.diameterBase, assessments, topK) : snapshot.diameterBase;
             snapshot.finalLandingOverlay = finalLandingCanvas(snapshot.finalLanding.ids);
         };
-        apply(unknown('space_pending'));
+        apply(unknownSpace('space_pending'), unknownDiameters());
         snapshot.spacePending = autoDA2 || base.eligible.length > 0;
         if (!snapshot.spacePending) return;
         const root = this.last;
@@ -2497,12 +2558,13 @@ class LiveView {
         const isCurrent = () => this.last === root && snapshot.spaceKey === key &&
             (!snapshot.depthSource || root.analyses[snapshot.depthSource] === snapshot);
         this.spaceClient.assess(source, key, sceneKey, snapshot.depth,
-            snapshot.pose, base, this.birdSpace, da2ReferenceM, root.mask, metricReference, autoDA2).then(({ assessments, cpuMs, calibration }) => {
+            snapshot.pose, base, this.birdSpace, minimumDiameter, da2ReferenceM, root?.mask ?? snapshot.mask,
+            metricReference, autoDA2).then(({ assessments, diameters, cpuMs, calibration }) => {
             if (!isCurrent()) return;
-            apply(assessments); snapshot.spaceCalibration = calibration; snapshot.spacePending = false; snapshot.spaceCpuMs = cpuMs; this.queueComparisonRender();
+            apply(assessments, diameters); snapshot.spaceCalibration = calibration; snapshot.spacePending = false; snapshot.spaceCpuMs = cpuMs; this.queueComparisonRender();
         }).catch((error) => {
             if (!isCurrent()) return;
-            apply(unknown(`space_error: ${error.message}`)); snapshot.spacePending = false; this.queueComparisonRender();
+            apply(unknownSpace(`space_error: ${error.message}`), unknownDiameters()); snapshot.spacePending = false; this.queueComparisonRender();
         });
     }
 
@@ -2753,8 +2815,7 @@ class LiveView {
         if (this.savingFigures) return null;
         const snapshot = this.last;
         if (!this.canSaveFigures(snapshot)) throw new Error('Wait for the current figures to finish updating');
-        // Freeze every displayed canvas and caption before the directory dialog
-        // yields control. Later camera/filter changes cannot mix saved frames.
+        // Freeze every displayed canvas and caption before asynchronous PNG encoding.
         const figures = freezeFigures(this.collectFigures());
         const prefix = `${snapshot.frameId}_figures_${Date.now()}`;
         const reference = snapshot.pose.gs_depth.scale_reference as BoxScaleReference | null;
@@ -2770,28 +2831,13 @@ class LiveView {
         this.figuresButton.disabled = true;
         this.figuresButton.textContent = 'Saving…';
         try {
-            const folder = this.getOutputFolder() ?? await this.chooseOutputFolder();
             const files = await encodeFigures(figures, 'BBox Manager · DA2 vs 3DGS', description);
-            let destination: string;
-            if (folder) {
-                const figuresDir = await folder.getDirectoryHandle('Figures', { create: true });
-                const output = await figuresDir.getDirectoryHandle(prefix, { create: true });
-                for (const file of files) await this.writeFile(file.name, file.blob, output);
-                destination = `${folder.name}/Figures/${prefix}/`;
-            } else {
-                destination = `${prefix}.zip`;
-                await this.writeFile(destination, await figureArchive(files), null);
-            }
-            const message = `Saved ${files.length} PNG figures, including overview.png · ${destination}`;
+            const destination = `${prefix}.zip`;
+            await this.writeFile(destination, await figureArchive(files), null);
+            const message = `Download started for ${files.length} PNG figures, including overview.png · ${destination}`;
             this.figuresButton.title = message;
             this.status.textContent = message;
             return { count: files.length, destination, frameId: snapshot.frameId };
-        } catch (error) {
-            if (error.name === 'AbortError') {
-                this.status.textContent = 'Figure save cancelled';
-                return null;
-            }
-            throw error;
         } finally {
             this.savingFigures = false;
             this.figuresButton.textContent = 'Save Figures';
@@ -2867,6 +2913,8 @@ class LiveView {
                 space_cpu_ms: snapshot.spaceCpuMs ?? null,
                 filters: { filter_gravity_angle: this.filterGravityAngle,
                     filter_minimum_length: this.filterGravityLength,
+                    filter_minimum_branch_diameter: this.filterBranchDiameter,
+                    min_branch_diameter_cm: this.minimumBranchDiameterM * 100,
                     filter_branch_shape: this.filterLandingShape,
                     filter_depth_spread: this.filterLandingDepthSpread,
                     filter_relative_height: this.filterLandingRelativeHeight,
